@@ -1,0 +1,51 @@
+# Stage 2 — Temporal Memory Distillation: RepViT-M0.9 student vs SAM3 ViT-H teacher
+# IMG_SIZE=1008 (SAM3 RoPE constraint), MAX_FRAMES=8 (ONNX static shape)
+
+DATA:
+  DATASET: sav
+  SAV_TAR_DIR: /mnt/hdd/datasets/SA-V/
+  SAV_INDEX_CACHE: data/sav_index.pkl
+  BATCH_SIZE: 2
+  NUM_WORKERS: 28
+  PREFETCH_FACTOR: 4
+  PIN_MEMORY: true
+  PERSISTENT_WORKERS: true
+  IMG_SIZE: 1008
+  MAX_FRAMES: 8
+
+MODEL:
+  TYPE: efficient_sam3_temporal
+  NAME: efficient_sam3_stage2
+  BACKBONE: repvit_m0_9
+  STUDENT_CKPT: checkpoints/efficient_sam3_repvit_s.pt
+  TEACHER_CKPT: /mnt/hdd/checkpoints/sam3/sam3.pt
+  PERCEIVER_DIM: 256
+  PERCEIVER_DEPTH: 4
+  PERCEIVER_LATENTS: 64
+  PERCEIVER_HEADS: 8
+
+DISTILL:
+  ENABLED: true
+  MSE_WEIGHT: 1.0
+  COSINE_WEIGHT: 1.0
+  FEATURE_DIM: 256
+
+TRAIN:
+  EPOCHS: 100
+  WARMUP_EPOCHS: 5
+  BASE_LR: 1.0e-4
+  WARMUP_LR: 1.0e-7
+  MIN_LR: 1.0e-6
+  WEIGHT_DECAY: 0.05
+  CLIP_GRAD: 1.0
+  AUTO_RESUME: true
+  AMP_DTYPE: bfloat16
+  ACCUMULATION_STEPS: 1
+
+EVAL:
+  EVERY_N_EPOCHS: 5
+
+AMP_ENABLE: true
+SAVE_FREQ: 1
+PRINT_FREQ: 10
+SEED: 42
