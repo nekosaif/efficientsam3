@@ -79,6 +79,15 @@ _C.TRAIN.USE_CHECKPOINT = False
 _C.TRAIN.AMP_DTYPE = 'bfloat16'      # bf16 on Ampere+
 _C.TRAIN.FIND_UNUSED_PARAMETERS = False
 
+# Mid-epoch checkpointing — protects against SIGHUP/preemption mid-epoch.
+# 0 = off (epoch-only saves). Suggested 1000–2000 for SA-V scale.
+_C.TRAIN.SAVE_EVERY_ITERS = 0
+
+# Weights EMA on Perceiver only (~5M params). Used for val-time smoothing.
+# NOT a teacher — teacher is the frozen SAM3 ViT-H.
+_C.TRAIN.EMA_ENABLE = True
+_C.TRAIN.EMA_DECAY = 0.999
+
 _C.TRAIN.LR_SCHEDULER = CN()
 _C.TRAIN.LR_SCHEDULER.NAME = 'cosine'
 _C.TRAIN.LR_SCHEDULER.DECAY_EPOCHS = 30

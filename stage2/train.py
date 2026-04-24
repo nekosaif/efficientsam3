@@ -15,6 +15,7 @@ save+resume, TensorBoard logging, periodic held-out SA-V val eval.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import random
 import sys
@@ -33,9 +34,14 @@ from stage2.config import get_config, MAX_FRAMES
 from stage2.data.build import build_loader
 from stage2.eval import evaluate_distill
 from stage2.loss import build_distill_loss
-from stage2.models import build_student_model, build_teacher_model
+from stage2.models import ModelEma, build_student_model, build_teacher_model
 from stage2.optim import CosineWarmupScheduler, build_optimizer
-from stage2.utils import auto_resume_helper, load_checkpoint, save_checkpoint
+from stage2.utils import (
+    auto_resume_helper,
+    load_checkpoint,
+    save_checkpoint,
+    save_running_checkpoint,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -165,8 +171,19 @@ def main():
     use_amp = config.AMP_ENABLE and not args.only_cpu
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
+    # -- EMA (Perceiver only) ----------------------------------------------
+    ema_perceiver = None
+    if config.TRAIN.EMA_ENABLE:
+        ema_perceiver = ModelEma(
+            student.module.perceiver, decay=config.TRAIN.EMA_DECAY, device=device,
+        )
+        n_ema = sum(p.numel() for p in ema_perceiver.module.parameters())
+        log(f"[stage2] EMA enabled on Perceiver: decay={config.TRAIN.EMA_DECAY} "
+            f"shadow={n_ema/1e6:.2f}M")
+
     # -- resume -------------------------------------------------------------
     start_epoch = config.TRAIN.START_EPOCH
+    step_in_epoch_resume = 0
     global_step = 0
     best_val: float | None = None
 
@@ -178,12 +195,24 @@ def main():
         meta = load_checkpoint(
             config=config, path=resume_path, model=student.module,
             optimizer=optimizer, scheduler=scheduler, scaler=scaler,
+            ema=ema_perceiver,
             map_location=f'cuda:{local_rank}',
         )
-        start_epoch = meta['epoch'] + 1
         global_step = meta['global_step']
         best_val = meta['best_val']
-        log(f"[stage2] resumed: epoch={meta['epoch']} step={global_step} best_val={best_val}")
+        if meta['step_in_epoch'] > 0:
+            # mid-epoch running checkpoint: resume in the same epoch, skip
+            # the first N batches (sampler is deterministic via set_epoch).
+            start_epoch = meta['epoch']
+            step_in_epoch_resume = meta['step_in_epoch']
+            log(f"[stage2] resumed MID-EPOCH: ep={start_epoch} "
+                f"skip_first={step_in_epoch_resume} step={global_step} best_val={best_val}")
+        else:
+            start_epoch = meta['epoch'] + 1
+            log(f"[stage2] resumed: epoch_done={meta['epoch']} next={start_epoch} "
+                f"step={global_step} best_val={best_val}")
+        if ema_perceiver is not None and not meta.get('has_ema'):
+            log("[stage2] ckpt has no EMA state — initialized fresh from current weights")
 
     # -- tb writer (rank 0 only) -------------------------------------------
     writer = None
@@ -221,7 +250,15 @@ def main():
         t_window = time.time()
         n_window = 0
 
+        # mid-epoch resume: skip batches we already processed in the prior
+        # interrupted run (sampler permutation is deterministic per-epoch).
+        skip_n = step_in_epoch_resume if epoch == start_epoch else 0
+        if skip_n > 0:
+            log(f"[stage2] ep{epoch}: skipping first {skip_n} batches (mid-epoch resume)")
+
         for step, batch in enumerate(loader_train):
+            if step < skip_n:
+                continue
             frames = batch['frames'].to(device, non_blocking=True)             # [B,T,3,H,W]
             attn_mask = batch['attention_mask'].to(device, non_blocking=True)  # [B,T]
             gt_masks = batch['masks'].to(device, non_blocking=True)            # [B,T,H,W]
@@ -236,6 +273,13 @@ def main():
                     t_out = teacher(frames, attn_mask, gt_masks, mask_valid)  # [B,T,256,H',W']
                 losses = loss_fn(s_out, t_out, attn_mask)
                 loss = losses.total / accum
+
+            loss_val = loss.item()
+            if not (loss_val == loss_val) or loss_val > 10.0:  # NaN or explosion
+                log(f"[stage2] BAD BATCH ep{epoch} it{step}: loss={loss_val:.2f} — skipping update")
+                optimizer.zero_grad(set_to_none=True)
+                n_window += frames.shape[0]
+                continue
 
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -259,6 +303,20 @@ def main():
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
                 scheduler.step(global_step)
+                if ema_perceiver is not None:
+                    ema_perceiver.update(student.module.perceiver)
+
+            # mid-epoch checkpoint (rank 0 only); guards against SIGHUP/preempt
+            save_every = int(config.TRAIN.SAVE_EVERY_ITERS)
+            if (save_every > 0 and is_main_process()
+                    and (step + 1) % save_every == 0):
+                rpath = save_running_checkpoint(
+                    config=config, epoch=epoch, global_step=global_step,
+                    step_in_epoch=step + 1,
+                    model=student.module, optimizer=optimizer, scheduler=scheduler,
+                    scaler=scaler, best_val=best_val, ema=ema_perceiver,
+                )
+                log(f"[stage2] ep{epoch} it{step+1}: running ckpt -> {rpath}")
 
             if step % config.PRINT_FREQ == 0:
                 dt = max(1e-6, time.time() - t_window)
@@ -285,6 +343,9 @@ def main():
 
         log(f"[stage2] epoch {epoch} done in {time.time()-t_epoch:.1f}s")
 
+        # epoch boundary crossed — subsequent epochs start at batch 0
+        step_in_epoch_resume = 0
+
         # -- periodic val eval --------------------------------------------
         do_eval = (loader_val is not None
                    and config.EVAL.EVERY_N_EPOCHS > 0
@@ -307,6 +368,26 @@ def main():
                 is_best = True
                 log(f"[stage2] new best val={best_val:.4f}")
 
+            # second val pass with EMA weights swapped in (if enabled)
+            if ema_perceiver is not None:
+                perceiver = student.module.perceiver
+                snapshot = copy.deepcopy(perceiver.state_dict())
+                ema_perceiver.copy_to(perceiver)
+                try:
+                    ema_result = evaluate_distill(
+                        student=student.module, teacher=teacher, loader=loader_val,
+                        loss_fn=loss_fn, device=device, amp_dtype=amp_dtype,
+                        use_amp=use_amp, max_batches=args.val_max_batches,
+                    )
+                finally:
+                    perceiver.load_state_dict(snapshot)
+                log(f"[stage2][val-ema] ep{epoch} total={ema_result.total:.4f} "
+                    f"mse={ema_result.mse:.4f} cos={ema_result.cosine:.4f}")
+                if writer is not None:
+                    writer.add_scalar('val/ema_loss_total', ema_result.total, epoch)
+                    writer.add_scalar('val/ema_loss_mse', ema_result.mse, epoch)
+                    writer.add_scalar('val/ema_loss_cosine', ema_result.cosine, epoch)
+
         # -- checkpoint (rank 0) ------------------------------------------
         if is_main_process() and ((epoch + 1) % config.SAVE_FREQ == 0 or is_best
                                   or epoch + 1 == config.TRAIN.EPOCHS):
@@ -314,6 +395,7 @@ def main():
                 config=config, epoch=epoch, global_step=global_step,
                 model=student.module, optimizer=optimizer, scheduler=scheduler,
                 scaler=scaler, best_val=best_val, is_best=is_best,
+                ema=ema_perceiver,
             )
             log(f"[stage2] saved {path}{'  [best]' if is_best else ''}")
         if dist.is_initialized():

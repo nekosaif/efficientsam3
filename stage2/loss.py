@@ -57,12 +57,18 @@ class DistillLoss(nn.Module):
         m_full = m.view(B, T, 1, 1, 1).expand_as(student_feat)
         n_valid_elems = m_full.sum().clamp_min(self.eps)
 
-        # ---- MSE (mean over valid elements) ----
-        mse = ((student_feat - teacher_feat) ** 2 * m_full).sum() / n_valid_elems
+        # L2-normalise along channel dim so MSE is scale-invariant [0, 4]
+        # Teacher feature magnitude varies 30-50x across SA-V videos; raw MSE
+        # would scale as magnitude^2, causing loss to range 2->2700.
+        s_norm = F.normalize(student_feat, p=2, dim=2)  # [B, T, C, H, W]
+        t_norm = F.normalize(teacher_feat, p=2, dim=2)
+
+        # ---- MSE on normalised features ----
+        mse = ((s_norm - t_norm) ** 2 * m_full).sum() / n_valid_elems
 
         # ---- cosine (per spatial token, then mean) ----
-        s = student_feat.permute(0, 1, 3, 4, 2).reshape(B * T * H * W, C)
-        t = teacher_feat.permute(0, 1, 3, 4, 2).reshape(B * T * H * W, C)
+        s = s_norm.permute(0, 1, 3, 4, 2).reshape(B * T * H * W, C)
+        t = t_norm.permute(0, 1, 3, 4, 2).reshape(B * T * H * W, C)
         cos = F.cosine_similarity(s, t, dim=-1, eps=self.eps)  # [B*T*H*W]
         token_mask = m.view(B, T, 1, 1).expand(B, T, H, W).reshape(-1)
         n_valid_tokens = token_mask.sum().clamp_min(self.eps)

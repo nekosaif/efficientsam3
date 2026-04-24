@@ -10,13 +10,11 @@
 
 ---
 
-## 1. Current State Snapshot — 2026-04-18 19:17 +0600
+## 1. Current State Snapshot — 2026-04-24 16:34 +0600
 
 - **Stage 2 (Temporal Memory Distillation) training is RUNNING.**
-- PID: `3933109` (read latest from `logs/stage2_run1.pid`)
-- Launched: 2026-04-18 19:09 local
-- Current elapsed when this doc was written: ~7 min
-- Early loss trajectory: 2.33 → 2.16 (descending as expected)
+- Launched: 2026-04-24 16:34 local, resuming from `ckpt_epoch_0.pth`
+- Current loss: ~0.82 (normalized scale; see §7 gotchas for scale change)
 - Target: **50 epochs**, ~5.4 days wall-clock on the current single GPU
 - Output dir: `output/efficient_sam3_stage2/ep50_run1/`
 - TensorBoard: `output/efficient_sam3_stage2/ep50_run1/tb/`
@@ -94,7 +92,7 @@ tensorboard --logdir output/efficient_sam3_stage2/ep50_run1/tb --port 6006
 # then open http://localhost:6006
 ```
 
-**Expected loss:** early rapid drop 2.3 → ~1.5 within a few hundred iters; then slow decay. Validate per-5-epoch eval shows val loss strictly decreasing (with noise).
+**Expected loss:** starts ~0.82 (normalized MSE+cosine scale); slow decay over 50 epochs. Validate per-5-epoch eval shows val loss strictly decreasing (with noise).
 
 ---
 
@@ -113,6 +111,10 @@ nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --data-path /mnt/hdd/datasets/SA-V/ \
   --tag ep50_run1 \
   --opts TRAIN.EPOCHS 50 \
+         TRAIN.EMA_ENABLE True \
+         TRAIN.EMA_DECAY 0.999 \
+         TRAIN.SAVE_EVERY_ITERS 0 \
+         TRAIN.CLIP_GRAD 0.3 \
   > logs/stage2_run1.log 2>&1 &
 echo $! > logs/stage2_run1.pid
 ```
@@ -146,6 +148,9 @@ crontab -l | grep -v health_check | crontab -
 - Worker count: **28 is the sweet spot** on this CPU. `24` is ok, `32` oversubscribes and throughput drops.
 - Pre-decoding SA-V to `.npy` frames was ruled out — would need ~1.2 TB, only 993 GB free.
 - Stage 1 checkpoint was moved under `./checkpoints/` — do NOT use `/mnt/hdd/checkpoints/sam3/efficient_sam3_repvit_s.pt` (older, now-wrong path).
+- **Loss scale changed (2026-04-24):** `stage2/loss.py` now L2-normalizes student+teacher features along channel dim before MSE. Loss is now bounded ~[0, 6] regardless of teacher feature magnitude (which varied 30-50× across SA-V videos causing optimizer corruption). Old raw-MSE runs had initial loss ~2.33; current normalized runs start ~0.82.
+- **No mid-epoch checkpoints:** `SAVE_EVERY_ITERS 0` — always resumes from epoch boundary. User preference: never resume mid-epoch.
+- **Grad clip = 0.3** (reduced from 1.0 to prevent output-head explosion).
 
 ---
 

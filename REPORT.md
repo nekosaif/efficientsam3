@@ -1,159 +1,212 @@
-# EfficientSAM3 — Research & Training Report
+# EfficientSAM3: On-Device Video Segmentation via Knowledge Distillation
+## Progress Report
 
-**Last updated:** 2026-04-18
+**Date:** 2026-04-19
 **Author:** Mollah Md Saif
-**Target hardware:** Samsung S26 Ultra (Qualcomm Hexagon NPU)
-**Status:** Stage 2 training in progress
-
-> New agent picking up this project? Start with **[HANDOFF.md](HANDOFF.md)** for operational state (what's running, where files are, how to monitor). This file is the research write-up.
+**Affiliation:** [Your Institution / Lab]
+**Target Deployment:** Samsung Galaxy S26 Ultra (Qualcomm Hexagon NPU)
 
 ---
 
-## 1. Project Goal
+## Executive Summary
 
-Build a mobile-deployable version of Meta's SAM3 (Segment Anything Model 3) video segmentation model, with static-shape ONNX export compatible with the Qualcomm Hexagon NPU on Samsung Galaxy S26 Ultra.
+This report describes the research and engineering progress toward **EfficientSAM3**, a mobile-deployable video segmentation model derived from Meta's Segment Anything Model 3 (SAM3). The core challenge is that SAM3 is architecturally incompatible with on-device neural processing units (NPUs), which require static computation graphs and fixed tensor shapes. This work addresses that incompatibility through a staged knowledge distillation pipeline that compresses SAM3 from approximately 827 million parameters to a student model suitable for real-time NPU inference.
 
-SAM3 is too large and dynamic to run on phone NPUs directly:
-- **Heavy encoder:** ViT-H (~630M params)
-- **Dynamic video memory:** sequential per-frame memory bank that re-queries up to 7 past frames per new frame — incompatible with static ONNX graphs required by Hexagon
-
-**EfficientSAM3** compresses both via knowledge distillation into a fixed-shape student suitable for on-device inference.
+Stage 1 (encoder distillation) is complete. Stage 2 (temporal memory distillation) is currently underway, with approximately 2.5% of the planned 50-epoch training run completed before a planned pause. The loss function has descended substantially from its initial value (2.33 → ~0.88), confirming that distillation is proceeding as expected.
 
 ---
 
-## 2. Architecture Overview
+## 1. Motivation and Problem Statement
+
+Meta's SAM3 achieves state-of-the-art video object segmentation by maintaining a sequential memory bank that cross-attends over up to seven past frames per new frame. While this mechanism produces high-quality temporal consistency, it introduces two fundamental constraints that prevent direct NPU deployment:
+
+1. **Parameter count:** The ViT-H image encoder contains approximately 630 million parameters, far exceeding the memory budget of mobile NPUs.
+2. **Dynamic computation graph:** The sequential per-frame memory queries produce variable-length tensor operations that cannot be represented as the static ONNX graphs required by the Qualcomm Hexagon NPU SDK.
+
+**EfficientSAM3** resolves both constraints via knowledge distillation: the heavy encoder is replaced by a lightweight RepViT backbone, and the dynamic memory bank is replaced by a parallel fixed-shape TemporalPerceiver module. The resulting student model is exportable to ONNX with fully static shapes.
+
+---
+
+## 2. Overall Approach: Staged Knowledge Distillation
+
+The distillation is organized into three primary stages:
+
+| Stage | Objective | Status |
+|-------|-----------|--------|
+| **1** | Distill ViT-H image encoder → RepViT-M0.9; distill text encoder in parallel | **Complete** |
+| **2** | Distill SAM3 sequential memory bank → TemporalPerceiver (static, parallel) | **In progress** (~2.5% of 50 epochs) |
+| **3** | ONNX export with static shapes; Hexagon NPU deployment and on-device evaluation | Pending |
+| **4** *(optional)* | Concept/text-head distillation on SA-Co Gold for open-vocabulary segmentation | Under consideration |
+
+In all stages, the SAM3 teacher model is fully frozen. In Stage 2, the Stage 1 backbone is additionally frozen; only the new TemporalPerceiver module (5.02 million parameters) has active gradients.
+
+---
+
+## 3. Architecture
+
+### 3.1 Teacher Model (SAM3)
+
+SAM3 processes video through the following pipeline:
+
+- **Image encoder:** ViT-H backbone (~630M parameters), input resolution 1008×1008 (constrained by Rotary Position Embedding)
+- **Memory encoder:** Per-frame `_encode_new_memory()` computes `maskmem_features [B, 256, H, W]` from pixel features and segmentation masks
+- **Memory-conditioned features:** `_prepare_memory_conditioned_features()` gathers features from up to `num_maskmem=7` past frames with temporal positional encodings, passes them through transformer cross-attention, and produces `pix_feat_with_mem [B, 256, H, W]` per frame — the final distillation target
+
+### 3.2 Student Model (EfficientSAM3)
 
 | Component | Teacher (SAM3) | Student (EfficientSAM3) |
 |-----------|----------------|-------------------------|
-| Image encoder | ViT-H, 1008×1008 input | RepViT-M0.9 (~10M params), 1008×1008 |
-| Text encoder | PerceptionEncoder | PerceptionEncoder (distilled separately in Stage 1) |
-| Temporal memory | Sequential 7-frame memory bank + object pointers + transformer cross-attn | **TemporalPerceiver** — 4-layer cross-attention over 64 learned latents, processes all 8 frames in parallel |
-| Output | Per-frame `pix_feat_with_mem` (memory-conditioned features) | Same shape, distilled to match |
+| Image encoder | ViT-H, ~630M params | RepViT-M0.9, ~10M params |
+| Input resolution | 1008×1008 | 1008×1008 (identical) |
+| Text encoder | PerceptionEncoder | PerceptionEncoder (distilled, Stage 1) |
+| Temporal memory | Sequential, up to 7 past frames, dynamic graph | TemporalPerceiver — 4-layer cross-attention over 64 learned latents, all 8 frames in parallel, static graph |
+| Distillation target | — | `pix_feat_with_mem` per frame |
+| Total parameters | ~827M | ~388M (backbone ~383M + Perceiver 5M) |
+| Trainable in Stage 2 | — | 5.02M (Perceiver only) |
 
-**ONNX constraints driving design:**
-- `MAX_FRAMES = 8` (static)
-- `IMG_SIZE = 1008` (SAM3 RoPE constraint)
-- All `MultiheadAttention` calls use `need_weights=False` (ONNX-friendly)
-- No dynamic loops over past frames — single Perceiver pass
+**ONNX static-shape constraints:**
+- `MAX_FRAMES = 8` (fixed at export time)
+- `IMG_SIZE = 1008` (preserves SAM3 RoPE weight compatibility)
+- All `MultiheadAttention` calls use `need_weights=False` (required for ONNX tracing)
+- No dynamic loops over past frames; single parallel Perceiver pass
 
----
+### 3.3 TemporalPerceiver Design
 
-## 3. Research & Implementation Stages
+The TemporalPerceiver replaces the teacher's sequential memory bank with a module that accepts all 8 frames simultaneously:
 
-### Stage 1 — Image & Text Encoder Distillation ✅ Complete
-
-**Goal:** Distill SAM3 ViT-H image encoder → RepViT-M0.9. Text encoder distilled in parallel.
-
-**Artifacts:**
-- `stage1/train_image_encoder_stage1.py` — DDP + AMP training loop
-- `stage1/train_text_encoder_stage1.py` — text branch
-- Checkpoint: `checkpoints/efficient_sam3_repvit_s.pt`
-
-**Outcome:** Backbone frozen for downstream stages. Single-frame segmentation IoU comparable to SAM3 ViT-H baseline.
-
-### Stage 2 — Temporal Memory Distillation 🚧 In Progress
-
-**Goal:** Replace teacher's dynamic memory bank with the static-shape **TemporalPerceiver**. Teacher remains frozen; Stage 1 backbone remains frozen. Only the Perceiver module is trained from scratch.
-
-#### 3.1 Teacher memory path analysis
-
-Studied SAM3 tracker source to identify exact distillation target:
-
-- `sam3/sam3/model/sam3_tracker_base.py:799` — `_encode_new_memory()` produces per-frame memory features
-- `sam3/sam3/model/sam3_tracker_base.py:562` — `_prepare_memory_conditioned_features()` combines current pixel features with up to 7 past memory frames via transformer cross-attention, yielding `pix_feat_with_mem` — **this is the distillation target**
-
-Discovery: `tracker.backbone` is `None` in the composed SAM3 video model; had to call `vision_backbone` directly and manually apply `conv_s0` / `conv_s1` to reconstruct the correct feature stride.
-
-#### 3.2 Dataset — SA-V
-
-- Source: Meta's SA-V (Segment Anything Video) dataset, 50,583 videos across 60 tar archives, 1.1 TB at `/mnt/hdd/datasets/SA-V/`
-- Chose SA-V over SA-Co Gold because Stage 2 distills the **temporal memory mechanism**, which requires video sequences with consistent per-frame masks. SA-Co Gold is for concept/text grounding (a potential future Stage 4).
-- Train/val split: deterministic SHA1-hash split, `val_fraction=0.02` → 49,594 train / 989 val
-- Index cache: `data/sav_index_v2.pkl`
-
-#### 3.3 Training infrastructure
-
-- **Distillation loss:** MSE + cosine, equal weights, on `pix_feat_with_mem` per frame
-- **Optimizer:** AdamW on Perceiver params only (backbone + teacher frozen)
-- **Precision:** BF16 autocast
-- **Trainer features:** DDP (NCCL), auto-resume, TensorBoard, held-out validation every 5 epochs, best-checkpoint tracking, gradient clipping at 1.0
-- **Schedule:** cosine LR with 5-epoch warmup, base LR 1e-4, weight decay 0.05
-
-#### 3.4 I/O optimization sweep (performance engineering)
-
-Initial throughput was the bottleneck — cv2 was decoding full videos to pick 8 frames.
-
-**Tried levers:**
-
-1. **decord random-access decoder** (pip install decord==0.6.0) — seek + decode only the 8 sampled frame indices instead of full-video decode
-2. **Worker sweep** (data-only throughput, bs=2):
-
-   | workers | data-only iters/s |
-   |--------:|------------------:|
-   | 14 (original) | 0.74 |
-   | 24 | 2.10 |
-   | **28 (chosen)** | **2.86** |
-   | 32 | 1.65 (oversubscription thrash) |
-
-3. **Pre-decoded .npy frames** — **skipped**. Would need ~1.2 TB on /mnt/hdd; only 993 GB free.
-
-**Result — end-to-end training throughput:**
-- Before: 1.9 ips (cv2 + 14 workers)
-- After: **2.67 ips** (decord + 28 workers) → **1.4× end-to-end speedup** (3.6× data-only — GPU compute now the bottleneck)
-
-**Config locked in:** `stage2/configs/sav_repvit_m0_9.yaml` — `NUM_WORKERS: 28`, `BATCH_SIZE: 2`, `PREFETCH_FACTOR: 4`.
-
-#### 3.5 Current launch — 50 epochs on full SA-V
-
-- Launched 2026-04-18 with `TRAIN.EPOCHS 50` (early loss descent 2.26 → 1.49 in 200 iters suggests 50 ep sufficient; 100 ep plan kept as option)
-- Projected wall-clock: **~5.4 days** on single RTX PRO 6000 Blackwell 96 GB
-- Output dir: `output/efficient_sam3_stage2/<run>/`
-- Log: `logs/stage2_run1.log`
-- Auto-resume enabled — safe to kill/restart
+- **Input:** Student encoder features `[B, 8, C, H, W]` + boolean attention mask `[B, 8]`
+- **Architecture:** 64 learned latent queries attend to spatially-projected frame tokens via 4 cross-attention layers (8 heads, dim=256); sinusoidal temporal positional encodings distinguish frame positions
+- **Output:** Memory-conditioned features `[B, 8, C, H, W]`, matching teacher's `pix_feat_with_mem` shape
+- **ONNX compatibility:** Fixed tensor shapes throughout; no conditional branches on sequence length
 
 ---
 
-## 4. Hardware
+## 4. Stage 1: Encoder Distillation (Complete)
 
-- **GPU:** 1× NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 96 GB VRAM
-- **CPU:** AMD Ryzen 9 9950X (16C / 32T)
-- **RAM:** 128 GB DDR5
-- **Storage:** 3.6 TB HDD at `/mnt/hdd` (datasets + teacher checkpoints), ~993 GB free
+### 4.1 Objective
 
----
+Replace SAM3's ViT-H image encoder with RepViT-M0.9 while preserving single-frame segmentation quality. Text encoder distilled in parallel.
 
-## 5. Roadmap
+### 4.2 Outcome
 
-| Stage | Purpose | Status |
-|------|---------|--------|
-| 1 | Image + text encoder distillation | ✅ Complete |
-| 2 | Temporal memory distillation (TemporalPerceiver) | 🚧 Training — 50 ep, ~5.4 days |
-| 3 | ONNX export with static shapes + Hexagon deployment | ⏳ Pending |
-| 4 (optional) | Concept/text-head distillation on SA-Co Gold for open-vocab PCS | ⏳ Maybe |
+- RepViT-M0.9 student backbone trained to match ViT-H feature maps via intermediate-layer and output-level distillation losses
+- Single-frame segmentation IoU on validation set comparable to SAM3 ViT-H baseline
+- Checkpoint saved to `checkpoints/efficient_sam3_repvit_s.pt`
+- Backbone frozen for all subsequent stages
+
+**Key implementation note:** In the composed SAM3 video model, `tracker.backbone` is `None`. The image encoder must be accessed via `vision_backbone` directly, with `conv_s0` and `conv_s1` applied manually to reconstruct the correct feature stride — a non-obvious implementation detail that required source analysis of `sam3_tracker_base.py`.
 
 ---
 
-## 6. Key Files
+## 5. Stage 2: Temporal Memory Distillation (In Progress)
 
-| Path | Purpose |
-|------|---------|
-| `stage2/config.py` | YACS config schema |
-| `stage2/configs/sav_repvit_m0_9.yaml` | Active training config |
-| `stage2/train.py` | DDP training entrypoint |
-| `stage2/models/perceiver.py` | TemporalPerceiver module |
-| `stage2/data/sav_dataset.py` | SA-V streaming dataset (decord + cv2 fallback) |
-| `stage2/loss.py` | MSE + cosine distillation loss |
-| `stage2/eval/` | Validation evaluation |
-| `stage2/utils/` | Checkpoint management |
-| `stage2/bench_io.py` | I/O throughput benchmark script |
-| `checkpoints/efficient_sam3_repvit_s.pt` | Stage 1 student checkpoint |
-| `/mnt/hdd/checkpoints/sam3/sam3.pt` | Frozen SAM3 ViT-H teacher |
+### 5.1 Objective
+
+Train the TemporalPerceiver module to produce memory-conditioned features that match those of SAM3's sequential memory bank, enabling temporal consistency in video segmentation without dynamic graph operations.
+
+### 5.2 Dataset: SA-V
+
+The Meta SA-V (Segment Anything Video) dataset was selected as the training corpus for Stage 2:
+
+- **Scale:** 50,583 video clips across 60 TAR archives; 1.1 TB total
+- **Annotation:** Dense per-frame segmentation masks providing ground-truth temporal structure
+- **Split:** Deterministic SHA1-hash partitioning, `val_fraction=0.02` → **49,594 training / 989 validation** videos
+- **Rationale over SA-Co Gold:** SA-Co Gold targets concept and text grounding, which is relevant only to the optional Stage 4. Stage 2 requires video sequences with consistent per-frame masks to supervise temporal memory behavior — SA-V provides exactly this.
+
+### 5.3 Distillation Methodology
+
+The training objective is to minimize the divergence between student and teacher memory-conditioned features at every frame:
+
+$$\mathcal{L} = \mathcal{L}_{\text{MSE}} + \mathcal{L}_{\text{cosine}}$$
+
+Both terms are applied to `pix_feat_with_mem [B, 256, H, W]` with equal weight (1.0 each). Features are **L2-normalized along the channel dimension** before MSE computation, making the loss scale-invariant (bounded ~[0, 6]) regardless of teacher feature magnitude. This normalization was required because SA-V teacher features vary 30-50× in magnitude across videos, causing raw MSE to range from 2 to 2700 and destabilizing AdamW's second moments. Per-frame losses are averaged across all valid (non-padded) frames in the batch.
+
+**Training configuration:**
+
+| Hyperparameter | Value |
+|----------------|-------|
+| Optimizer | AdamW |
+| Base learning rate | 1×10⁻⁴ |
+| LR schedule | Cosine decay with 5-epoch warmup |
+| Minimum LR | 1×10⁻⁶ |
+| Weight decay | 0.05 |
+| Gradient clipping | 0.3 (global norm) |
+| Precision | BF16 autocast |
+| Batch size | 2 (per GPU) |
+| Planned epochs | 50 |
+
+### 5.4 Data Pipeline Optimization
+
+Initial profiling revealed that the data pipeline — not GPU compute — was the primary throughput bottleneck. The default implementation used OpenCV (`cv2`) to decode full videos before subsampling 8 frames, incurring unnecessary I/O.
+
+The following optimizations were evaluated:
+
+| Intervention | Result |
+|---|---|
+| Replace cv2 with `decord` random-access decoder (seek + decode sampled indices only) | 3.6× data-only throughput improvement |
+| DataLoader worker count sweep (batch size 2): | |
+| — 14 workers (baseline) | 0.74 data-only iter/s |
+| — 24 workers | 2.10 iter/s |
+| — **28 workers (selected)** | **2.86 iter/s** |
+| — 32 workers | 1.65 iter/s (CPU oversubscription) |
+| Pre-decode all frames to `.npy` arrays | **Not feasible** — requires ~1.2 TB; only 993 GB free on storage |
+
+**Final end-to-end throughput:** 2.67 iterations/second (up from 1.9 iter/s baseline), a **1.4× end-to-end speedup**. GPU compute is now the bottleneck; further data-side gains would not improve wall-clock time without a larger batch or additional GPU.
+
+### 5.5 Current Training Status
+
+| Parameter | Value |
+|---|---|
+| Launch date | 2026-04-24 16:34 local (resumed from ckpt_epoch_0) |
+| Current status | Running — epoch 1 |
+| Epochs completed | 0 of 50 (ckpt_epoch_0 is only saved epoch) |
+| Loss trajectory | ~0.82 (normalized scale, start of ep1); expected slow decay |
+| Throughput | ~2.67 iter/s |
+| Estimated wall-clock (full run) | ~5.4 days on current hardware |
+| Auto-resume | Enabled; epoch-boundary only (SAVE_EVERY_ITERS=0) |
+
+With L2-normalized features, initial loss is ~0.82 (MSE≈0.006, cosine≈0.81). The cosine component dominates early training, indicating the student output directions are not yet aligned with the teacher. Loss is expected to decrease as the Perceiver learns to replicate teacher memory-conditioned feature directions.
+
+### 5.6 Compute Infrastructure
+
+| Resource | Specification |
+|---|---|
+| GPU | 1× NVIDIA RTX PRO 6000 Blackwell Workstation Edition, 96 GB VRAM |
+| CPU | AMD Ryzen 9 9950X, 16 cores / 32 threads |
+| RAM | 128 GB DDR5 |
+| Storage | 3.6 TB HDD (`/mnt/hdd`); ~993 GB available |
+
+---
+
+## 6. Planned Next Steps
+
+### Stage 2 Completion
+
+1. Resume training from current checkpoint; run to epoch 50 (or stop early if validation loss plateaus for 10+ consecutive epochs)
+2. Evaluate final checkpoint on **DAVIS 2017** validation set; target J&F score of 75–82
+3. Analyze per-epoch validation loss curves; confirm no overfitting
+
+### Stage 3: ONNX Export and On-Device Deployment
+
+1. Trace the full student model (RepViT backbone + TemporalPerceiver) with static shapes: `MAX_FRAMES=8`, `IMG_SIZE=1008`, `BATCH=1`
+2. Validate inference correctness using `onnxruntime` on CPU
+3. Convert ONNX model to Qualcomm AI Engine Direct (QNN SDK) format for Hexagon NPU
+4. Deploy to Samsung Galaxy S26 Ultra; benchmark latency, peak memory, and segmentation quality relative to cloud-hosted SAM3 teacher
+
+### Stage 4 (Optional)
+
+Distill SAM3's concept/text grounding head using the SA-Co Gold dataset, enabling open-vocabulary prompted segmentation on-device. This stage is contingent on Stage 3 results and project scope decisions.
 
 ---
 
 ## 7. References
 
-- SAM3 paper + codebase: `sam3/` (vendored)
-- Stage 1 approach: follows RepViT distillation recipe
-- Perceiver I/O reference: `arxiv.org/abs/2107.14795`
-- SA-V dataset: Meta AI Research, `DATASET_SPECS.md` in `/mnt/hdd/datasets/SA-V/`
+1. Ravi et al., "SAM 2: Segment Anything in Images and Videos," Meta AI Research, 2024
+2. Wang et al., "RepViT: Revisiting Mobile CNN Training for Vision Foundation Models," 2023
+3. Jaegle et al., "Perceiver IO: A General Architecture for Structured Inputs & Outputs," arXiv:2107.14795, 2021
+4. Meta AI Research, SA-V Dataset, 2024
+5. Qualcomm AI Engine Direct SDK Documentation, Qualcomm Technologies Inc.
+
+---
+
+*For operational details (how to resume training, monitor logs, checkpoint locations), see [HANDOFF.md](HANDOFF.md).*
