@@ -77,8 +77,26 @@ class StudentTemporalModel(nn.Module):
             self.conv_s0.eval()
             self.conv_s1.eval()
 
+        self._freeze_backbone = freeze_backbone
+
         # free unused base submodules to reclaim VRAM
         del base
+
+    def train(self, mode: bool = True):
+        """Keep frozen backbone modules in eval mode regardless of student mode.
+
+        PyTorch's Module.train() recurses into all children, which would override
+        the eval() calls set during __init__ for the frozen backbone. This override
+        re-applies eval() after the recursive call so BN running stats stay fixed
+        at their initial (Stage 1) values — making training-time val and standalone
+        --eval produce consistent results.
+        """
+        super().train(mode)
+        if self._freeze_backbone:
+            self.vision_backbone.eval()
+            self.conv_s0.eval()
+            self.conv_s1.eval()
+        return self
 
     # ------------------------------------------------------------------
     # Per-frame feature extraction

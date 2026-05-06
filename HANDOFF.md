@@ -15,7 +15,7 @@
 - **Stage 2 (Temporal Memory Distillation) training is RUNNING.**
 - Launched: 2026-04-24 16:34 local, resuming from `ckpt_epoch_0.pth`
 - Current loss: ~0.82 (normalized scale; see §7 gotchas for scale change)
-- Target: **50 epochs**, ~5.4 days wall-clock on the current single GPU
+- Target: **50 epochs**, ~11 days wall-clock on the current single GPU (~5.3h/epoch)
 - Output dir: `output/efficient_sam3_stage2/ep50_run1/`
 - TensorBoard: `output/efficient_sam3_stage2/ep50_run1/tb/`
 - Log: `logs/stage2_run1.log`
@@ -170,7 +170,7 @@ Optional **Stage 4** (SA-Co Gold, concept/text head) only if you want open-vocab
 
 - "Is training still alive / what's the loss?" → §4 Quick live check
 - "Did it crash?" → check log tail for `Traceback|CUDA|OOM|Killed|RuntimeError`
-- "How long until done?" → `iters/s × remaining iters`; baseline 2.67 ips, 24,797 iters/epoch, 50 epochs
+- "How long until done?" → use epoch wall time (~19,200s/epoch); log `ips` is *samples/sec* (batch=2 videos), not iters/sec — true iter rate ≈ 1.3/s. 50 epochs ≈ 11 days total.
 - "Can we speed it up?" → remaining levers: `torch.compile` on the Perceiver, larger batch if VRAM permits, mixed-precision tweaks. Pre-decode still blocked on disk.
 - "Should we stop early?" → yes if val loss plateaus for 10+ epochs
 

@@ -67,6 +67,16 @@ def parse_option():
     parser.add_argument('--no-val', action='store_true', help='skip held-out val eval during training')
     parser.add_argument('--val-max-batches', type=int, default=-1,
                         help='cap val batches per eval; -1 = full val set')
+    parser.add_argument('--calibrate-bn-batches', type=int, default=0,
+                        help='run N batches in train mode before --eval to warm up backbone BN '
+                             'running stats (needed for checkpoints saved before the '
+                             'StudentTemporalModel.train() override, i.e. ep1-17)')
+    parser.add_argument('--backbone-bn-train-mode', action='store_true',
+                        help='keep backbone BN in train mode during eval (per-batch stats). '
+                             'Required for ep1-ep17 checkpoints where backbone ran in train '
+                             'mode throughout training and Perceiver learned batch-normalised '
+                             'features. Without this flag, eval mode BN changes the feature '
+                             'distribution enough to push cosine similarity to ~0.')
     parser.add_argument('--throughput', action='store_true')
     parser.add_argument('--smoke-test', action='store_true',
                         help='exit after a few iters to validate forward/backward')
@@ -232,15 +242,17 @@ def main():
             student=student.module, teacher=teacher, loader=loader_val,
             loss_fn=loss_fn, device=device, amp_dtype=amp_dtype,
             use_amp=use_amp, max_batches=args.val_max_batches,
+            calibrate_bn_batches=args.calibrate_bn_batches,
+            backbone_bn_train_mode=args.backbone_bn_train_mode,
         )
         log(f"[stage2][eval] total={result.total:.4f} mse={result.mse:.4f} "
-            f"cos={result.cosine:.4f} n={result.n_batches}")
+            f"cos={result.cosine:.4f} norm={result.norm:.4f} n={result.n_batches}")
         if dist.is_initialized():
             dist.destroy_process_group()
         return
 
     # -- training loop ------------------------------------------------------
-    log(f"[stage2] entering training loop (start_epoch={start_epoch} step={global_step})")
+    log(f"[stage2] entering training loop (start_epoch={start_epoch} step={global_step} total_epochs={config.TRAIN.EPOCHS})")
     accum = max(1, config.TRAIN.ACCUMULATION_STEPS)
 
     for epoch in range(start_epoch, config.TRAIN.EPOCHS):
@@ -323,12 +335,15 @@ def main():
                 ips = n_window / dt
                 log(f"[stage2] ep{epoch} it{step}/{len(loader_train)} "
                     f"loss={losses.total.item():.4f} mse={losses.mse.item():.4f} "
-                    f"cos={losses.cosine.item():.4f} lr={scheduler.get_lr():.2e} "
+                    f"cos={losses.cosine.item():.4f} norm={losses.norm.item():.4f} "
+                    f"lr={scheduler.get_lr():.2e} "
                     f"ips={ips:.2f} mask_sum={attn_mask.sum().item()}")
+                # note: ips = samples/sec (n_window += batch_size); iter/s = ips / batch_size
                 if writer is not None:
                     writer.add_scalar('train/loss_total', losses.total.item(), global_step)
                     writer.add_scalar('train/loss_mse', losses.mse.item(), global_step)
                     writer.add_scalar('train/loss_cosine', losses.cosine.item(), global_step)
+                    writer.add_scalar('train/loss_norm', losses.norm.item(), global_step)
                     writer.add_scalar('train/lr', scheduler.get_lr(), global_step)
                     writer.add_scalar('train/ips', ips, global_step)
                 t_window = time.time(); n_window = 0
@@ -358,11 +373,12 @@ def main():
                 use_amp=use_amp, max_batches=args.val_max_batches,
             )
             log(f"[stage2][val] ep{epoch} total={result.total:.4f} mse={result.mse:.4f} "
-                f"cos={result.cosine:.4f} n={result.n_batches}")
+                f"cos={result.cosine:.4f} norm={result.norm:.4f} n={result.n_batches}")
             if writer is not None:
                 writer.add_scalar('val/loss_total', result.total, epoch)
                 writer.add_scalar('val/loss_mse', result.mse, epoch)
                 writer.add_scalar('val/loss_cosine', result.cosine, epoch)
+                writer.add_scalar('val/loss_norm', result.norm, epoch)
             if best_val is None or result.total < best_val:
                 best_val = result.total
                 is_best = True
@@ -382,11 +398,12 @@ def main():
                 finally:
                     perceiver.load_state_dict(snapshot)
                 log(f"[stage2][val-ema] ep{epoch} total={ema_result.total:.4f} "
-                    f"mse={ema_result.mse:.4f} cos={ema_result.cosine:.4f}")
+                    f"mse={ema_result.mse:.4f} cos={ema_result.cosine:.4f} norm={ema_result.norm:.4f}")
                 if writer is not None:
                     writer.add_scalar('val/ema_loss_total', ema_result.total, epoch)
                     writer.add_scalar('val/ema_loss_mse', ema_result.mse, epoch)
                     writer.add_scalar('val/ema_loss_cosine', ema_result.cosine, epoch)
+                    writer.add_scalar('val/ema_loss_norm', ema_result.norm, epoch)
 
         # -- checkpoint (rank 0) ------------------------------------------
         if is_main_process() and ((epoch + 1) % config.SAVE_FREQ == 0 or is_best

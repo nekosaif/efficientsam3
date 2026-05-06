@@ -59,6 +59,7 @@ _C.DISTILL = CN()
 _C.DISTILL.ENABLED = True
 _C.DISTILL.MSE_WEIGHT = 1.0
 _C.DISTILL.COSINE_WEIGHT = 1.0
+_C.DISTILL.NORM_WEIGHT = 0.0          # log-ratio norm matching (0 = off); set >0 to prevent mlp collapse
 _C.DISTILL.FEATURE_DIM = 256         # teacher pix_feat_with_mem channel dim
 
 # -----------------------------------------------------------------------------

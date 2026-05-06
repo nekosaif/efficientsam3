@@ -1,0 +1,34 @@
+Everything is running. Here's the full picture:                                                                                                                                       
+                                                                                                                                                                                        
+  ---                                                                                                                                                                                   
+  What's running:                   
+                                                                                                                                                                                        
+  ┌──────────────────────┬────────┬───────────────────────┐           
+  │       Process        │  PID   │          Log          │                                                                                                                             
+  ├──────────────────────┼────────┼───────────────────────┤           
+  │ Training (ep50_run2) │ 137295 │ logs/stage2_run2.log  │
+  ├──────────────────────┼────────┼───────────────────────┤
+  │ Watch & eval         │ 137539 │ logs/autoeval_ep1.log │                                                                                                                             
+  └──────────────────────┴────────┴───────────────────────┘
+                                                                                                                                                                                        
+  What the watcher does (fully autonomous):                                                                                                                                             
+  1. Polls every 60s for output/efficient_sam3_stage2/ep50_run2/ckpt_epoch_1.pth
+  2. Epoch 1 finishes in ~5.2 hours → checkpoint appears                                                                                                                                
+  3. Sleeps 120s (training stabilizes into epoch 2)                   
+  4. Runs torchrun ... --eval --val-max-batches 100 on port 29512 (no conflict with training's 29511)                                                                                   
+  5. Writes PASS/FAIL to logs/autoeval_ep1.log                                                       
+                                                                                                                                                                                        
+  PASS criteria:                                                      
+  - cos < 1.0 — Perceiver is learning direction (below random baseline)                                                                                                                 
+  - norm < 2.0 — norms within 4× of teacher (no re-collapse)                                                                                                                            
+                                                                                                                                                                                        
+  Is 2 epochs enough? Yes for a sanity check. After 2 epochs you can confirm:                                                                                                           
+  - Loss is decreasing (check logs/stage2_run2.log for loss= trend)                                                                                                                     
+  - norm= stays near 0 (new loss working, no re-collapse)                                                                                                                               
+  - No crashes                                                                                                                                                                          
+                                                                                                                                                                                        
+  Not enough to judge final quality — that comes from the epoch-4 val (built into training, fires automatically via EVERY_N_EPOCHS=5).
+                                                                                                                                                                                        
+  To check status at any point:                                                                                                                                                         
+  tail -5 logs/stage2_run2.log          # training progress                                                                                                                             
+  cat logs/autoeval_ep1.log             # watcher status / final PASS/FAIL

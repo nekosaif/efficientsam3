@@ -23,13 +23,21 @@ class DistillLossOutput:
     total: torch.Tensor
     mse: torch.Tensor
     cosine: torch.Tensor
+    norm: torch.Tensor
 
 
 class DistillLoss(nn.Module):
-    def __init__(self, mse_weight: float = 1.0, cosine_weight: float = 1.0, eps: float = 1e-6):
+    def __init__(
+        self,
+        mse_weight: float = 1.0,
+        cosine_weight: float = 1.0,
+        norm_weight: float = 0.0,
+        eps: float = 1e-6,
+    ):
         super().__init__()
         self.mse_weight = mse_weight
         self.cosine_weight = cosine_weight
+        self.norm_weight = norm_weight
         self.eps = eps
 
     def forward(
@@ -74,12 +82,30 @@ class DistillLoss(nn.Module):
         n_valid_tokens = token_mask.sum().clamp_min(self.eps)
         cosine_loss = ((1.0 - cos) * token_mask).sum() / n_valid_tokens
 
-        total = self.mse_weight * mse + self.cosine_weight * cosine_loss
-        return DistillLossOutput(total=total, mse=mse.detach(), cosine=cosine_loss.detach())
+        # ---- norm matching (per spatial token, log-ratio) ----
+        # log(s_norm/t_norm)^2 = 0 when norms match; scale-invariant.
+        # Prevents the degenerate attractor where mlp_out grows unboundedly
+        # while the scale-invariant direction loss stays low.
+        s_norms = student_feat.norm(p=2, dim=2)   # [B, T, H, W]
+        t_norms = teacher_feat.norm(p=2, dim=2).detach()
+        log_ratio = torch.log(s_norms.clamp_min(self.eps) / t_norms.clamp_min(self.eps))
+        token_mask_4d = m.view(B, T, 1, 1).expand(B, T, H, W)
+        norm_loss = (log_ratio.pow(2) * token_mask_4d).sum() / n_valid_tokens
+
+        total = (self.mse_weight * mse
+                 + self.cosine_weight * cosine_loss
+                 + self.norm_weight * norm_loss)
+        return DistillLossOutput(
+            total=total,
+            mse=mse.detach(),
+            cosine=cosine_loss.detach(),
+            norm=norm_loss.detach(),
+        )
 
 
 def build_distill_loss(config) -> DistillLoss:
     return DistillLoss(
         mse_weight=config.DISTILL.MSE_WEIGHT,
         cosine_weight=config.DISTILL.COSINE_WEIGHT,
+        norm_weight=config.DISTILL.NORM_WEIGHT,
     )

@@ -24,8 +24,8 @@ Also read `HANDOFF.md` (context) + `REPORT.md` (research) for background.
 | Mid-epoch ckpt | **disabled** (SAVE_EVERY_ITERS=0) |
 | Batch / GPU | 2 |
 | Workers | 28 |
-| Throughput | ~2.6 iters/s |
-| Wall-clock | ~5.4 days for 50 ep |
+| Throughput | ~2.6 samples/s (~1.3 iters/s; log `ips` = samples/sec, batch=2) |
+| Wall-clock | ~11 days for 50 ep (~5.3h/epoch) |
 
 ---
 

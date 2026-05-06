@@ -1,0 +1,572 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>EfficientSAM3 · Training Dashboard</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  body { font-family: 'Inter', sans-serif; background: #020617; }
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .card {
+    background: linear-gradient(135deg, rgba(15,23,42,0.9) 0%, rgba(15,23,42,0.7) 100%);
+    border: 1px solid rgba(51,65,85,0.6);
+    border-radius: 12px;
+    backdrop-filter: blur(8px);
+  }
+  .card-glow-green { box-shadow: 0 0 20px rgba(16,185,129,0.08); }
+  .card-glow-blue  { box-shadow: 0 0 20px rgba(59,130,246,0.08); }
+  .card-glow-amber { box-shadow: 0 0 20px rgba(245,158,11,0.08); }
+  .card-glow-red   { box-shadow: 0 0 20px rgba(239,68,68,0.08); }
+  .progress-track {
+    background: rgba(30,41,59,0.8);
+    border-radius: 9999px;
+    height: 6px;
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    border-radius: 9999px;
+    transition: width 1s ease;
+    background: linear-gradient(90deg, #10b981, #34d399);
+  }
+  .progress-fill-blue {
+    background: linear-gradient(90deg, #3b82f6, #60a5fa);
+  }
+  .stat-value {
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+  .stat-label {
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: #64748b;
+  }
+  .pill-alive  { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+  .pill-dead   { background: rgba(239,68,68,0.15);  color: #f87171; border: 1px solid rgba(239,68,68,0.3); }
+  .pill-unknown{ background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+  .gauge-ring { transition: stroke-dashoffset 1s ease; }
+  .section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #475569;
+  }
+  .sparkline-canvas { width: 100%; height: 60px; display: block; }
+  .divider { border-color: rgba(51,65,85,0.4); }
+  .loss-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 2px 8px; border-radius: 6px; font-size: 0.75rem; font-weight: 500;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(71,85,105,0.5); border-radius: 3px; }
+  .plotly-chart { border-radius: 8px; overflow: hidden; }
+  .gpu-meter-bar {
+    height: 8px; border-radius: 4px; overflow: hidden;
+    background: rgba(30,41,59,0.8); margin-top: 4px;
+  }
+  .gpu-meter-fill { height: 100%; border-radius: 4px; transition: width 1s ease; }
+  .temp-badge {
+    padding: 2px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; mono;
+  }
+</style>
+</head>
+<body class="min-h-screen text-slate-100 p-4">
+
+<!-- Header -->
+<div class="flex items-center justify-between mb-5">
+  <div class="flex items-center gap-3">
+    <div class="w-8 h-8 rounded-lg bg-emerald-500/20 flex items-center justify-center border border-emerald-500/30">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#34d399" stroke-width="2.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+    </div>
+    <div>
+      <h1 class="text-lg font-bold text-slate-100 leading-none">EfficientSAM3</h1>
+      <p class="text-xs text-slate-500 mt-0.5">Stage 2 · Temporal Memory Distillation · <span class="mono text-slate-400" id="run-tag">ep50_run1</span></p>
+    </div>
+  </div>
+  <div class="flex items-center gap-3">
+    <span class="text-xs text-slate-500 mono" id="last-update">—</span>
+    <span id="status-pill" class="pill-unknown px-3 py-1 rounded-full text-xs font-semibold mono">● UNKNOWN</span>
+  </div>
+</div>
+
+<!-- Top stat cards -->
+<div class="grid grid-cols-2 lg:grid-cols-4 gap-3 mb-4">
+
+  <!-- Epoch card -->
+  <div class="card card-glow-green p-4">
+    <p class="stat-label mb-2">Epoch</p>
+    <div class="flex items-end gap-2 mb-2">
+      <span class="stat-value text-emerald-400 mono" id="epoch-current">—</span>
+      <span class="text-slate-500 text-sm mb-1">/ <span id="epoch-total">—</span></span>
+    </div>
+    <div class="progress-track mb-1">
+      <div class="progress-fill" id="epoch-bar" style="width:0%"></div>
+    </div>
+    <p class="text-xs text-slate-500 mono" id="epoch-pct">0.0%</p>
+  </div>
+
+  <!-- Iteration card -->
+  <div class="card card-glow-blue p-4">
+    <p class="stat-label mb-2">Iteration</p>
+    <div class="flex items-end gap-2 mb-2">
+      <span class="stat-value text-blue-400 mono" id="iter-current">—</span>
+      <span class="text-slate-500 text-sm mb-1">/ <span id="iter-total" class="text-xs">—</span></span>
+    </div>
+    <div class="progress-track mb-1">
+      <div class="progress-fill progress-fill-blue" id="iter-bar" style="width:0%"></div>
+    </div>
+    <p class="text-xs text-slate-500 mono" id="global-step">global step: —</p>
+  </div>
+
+  <!-- Elapsed card -->
+  <div class="card p-4">
+    <p class="stat-label mb-2">Elapsed</p>
+    <p class="stat-value text-slate-200 mono" id="elapsed">—</p>
+    <div class="mt-3 pt-3 border-t divider">
+      <p class="text-xs text-slate-500">avg epoch</p>
+      <p class="text-sm font-semibold text-slate-300 mono" id="epoch-avg">—</p>
+    </div>
+  </div>
+
+  <!-- ETA card -->
+  <div class="card card-glow-amber p-4">
+    <p class="stat-label mb-2">ETA</p>
+    <p class="stat-value text-amber-400 mono" id="eta">—</p>
+    <div class="mt-3 pt-3 border-t divider">
+      <p class="text-xs text-slate-500">remaining iters</p>
+      <p class="text-sm font-semibold text-slate-300 mono" id="remaining-iters">—</p>
+    </div>
+  </div>
+</div>
+
+<!-- Loss summary row -->
+<div class="card p-4 mb-4">
+  <div class="flex flex-wrap items-center gap-x-6 gap-y-2">
+    <div class="section-title">Live Loss</div>
+    <div class="flex flex-wrap gap-2" id="loss-badges">
+      <span class="loss-badge bg-emerald-500/10 border border-emerald-500/20 text-emerald-400"><span class="dot" style="background:#34d399"></span>total <span class="mono font-bold" id="badge-total">—</span></span>
+      <span class="loss-badge bg-blue-500/10 border border-blue-500/20 text-blue-400"><span class="dot" style="background:#60a5fa"></span>mse <span class="mono font-bold" id="badge-mse">—</span></span>
+      <span class="loss-badge bg-purple-500/10 border border-purple-500/20 text-purple-400"><span class="dot" style="background:#c084fc"></span>cosine <span class="mono font-bold" id="badge-cos">—</span></span>
+      <span class="loss-badge bg-slate-700/40 border border-slate-600/30 text-slate-400"><span class="dot" style="background:#94a3b8"></span>lr <span class="mono font-bold" id="badge-lr">—</span></span>
+      <span class="loss-badge bg-slate-700/40 border border-slate-600/30 text-slate-400"><span class="dot" style="background:#94a3b8"></span>ips <span class="mono font-bold" id="badge-ips">—</span></span>
+    </div>
+    <div class="ml-auto flex flex-wrap gap-2">
+      <span class="loss-badge bg-amber-500/10 border border-amber-500/20 text-amber-400">val <span class="mono font-bold" id="badge-val">—</span></span>
+      <span class="loss-badge bg-orange-500/10 border border-orange-500/20 text-orange-300">ema <span class="mono font-bold" id="badge-ema">—</span></span>
+      <span class="loss-badge bg-rose-500/10 border border-rose-500/20 text-rose-400">best <span class="mono font-bold" id="badge-best">—</span></span>
+    </div>
+  </div>
+</div>
+
+<!-- Charts row 1: Train loss -->
+<div class="grid grid-cols-1 xl:grid-cols-3 gap-3 mb-4">
+  <div class="card p-4 xl:col-span-2">
+    <p class="section-title mb-3">Train Loss</p>
+    <div id="chart-train" class="plotly-chart" style="height:220px"></div>
+  </div>
+  <div class="card p-4">
+    <p class="section-title mb-3">Val Loss + EMA</p>
+    <div id="chart-val" class="plotly-chart" style="height:220px"></div>
+  </div>
+</div>
+
+<!-- Charts row 2: LR + IPS -->
+<div class="grid grid-cols-2 gap-3 mb-4">
+  <div class="card p-4">
+    <p class="section-title mb-3">Learning Rate</p>
+    <div id="chart-lr" class="plotly-chart" style="height:150px"></div>
+  </div>
+  <div class="card p-4">
+    <p class="section-title mb-3">Throughput (iter/s)</p>
+    <div id="chart-ips" class="plotly-chart" style="height:150px"></div>
+  </div>
+</div>
+
+<!-- GPU + CPU row -->
+<div class="grid grid-cols-1 lg:grid-cols-2 gap-3 mb-4">
+
+  <!-- GPU card -->
+  <div class="card card-glow-red p-4">
+    <div class="flex items-center justify-between mb-3">
+      <div>
+        <p class="section-title">GPU</p>
+        <p class="text-xs text-slate-400 mt-0.5 mono" id="gpu-name">—</p>
+      </div>
+      <span id="gpu-temp-badge" class="temp-badge mono bg-slate-800 text-slate-300">—°C</span>
+    </div>
+
+    <div class="grid grid-cols-2 gap-4 mb-3">
+      <div>
+        <p class="text-xs text-slate-500 mb-1">Utilization</p>
+        <p class="text-2xl font-bold mono text-red-400" id="gpu-util">—%</p>
+        <div class="gpu-meter-bar"><div class="gpu-meter-fill" id="gpu-util-bar" style="background:linear-gradient(90deg,#ef4444,#f87171);width:0%"></div></div>
+      </div>
+      <div>
+        <p class="text-xs text-slate-500 mb-1">VRAM</p>
+        <p class="text-2xl font-bold mono text-red-400" id="gpu-vram">—</p>
+        <div class="gpu-meter-bar"><div class="gpu-meter-fill" id="gpu-vram-bar" style="background:linear-gradient(90deg,#f59e0b,#fbbf24);width:0%"></div></div>
+        <p class="text-xs text-slate-500 mono mt-1" id="gpu-vram-total">/ — GB</p>
+      </div>
+      <div>
+        <p class="text-xs text-slate-500 mb-1">Power</p>
+        <p class="text-xl font-bold mono text-orange-400" id="gpu-power">—W</p>
+      </div>
+      <div>
+        <p class="text-xs text-slate-500 mb-1">Fan</p>
+        <p class="text-xl font-bold mono text-slate-300" id="gpu-fan">—%</p>
+      </div>
+    </div>
+
+    <p class="section-title mb-2">Live · GPU Util & Temp (2 min)</p>
+    <canvas id="spark-gpu" class="sparkline-canvas"></canvas>
+  </div>
+
+  <!-- CPU / RAM card -->
+  <div class="card p-4">
+    <div class="flex items-center justify-between mb-3">
+      <p class="section-title">CPU &amp; RAM</p>
+      <span class="text-xs text-slate-500 mono" id="cpu-load">load —</span>
+    </div>
+
+    <div class="grid grid-cols-2 gap-4 mb-3">
+      <div>
+        <p class="text-xs text-slate-500 mb-1">CPU</p>
+        <p class="text-2xl font-bold mono text-blue-400" id="cpu-util">—%</p>
+        <div class="gpu-meter-bar"><div class="gpu-meter-fill" id="cpu-util-bar" style="background:linear-gradient(90deg,#3b82f6,#60a5fa);width:0%"></div></div>
+      </div>
+      <div>
+        <p class="text-xs text-slate-500 mb-1">RAM</p>
+        <p class="text-2xl font-bold mono text-blue-400" id="ram-util">—%</p>
+        <div class="gpu-meter-bar"><div class="gpu-meter-fill" id="ram-util-bar" style="background:linear-gradient(90deg,#8b5cf6,#a78bfa);width:0%"></div></div>
+        <p class="text-xs text-slate-500 mono mt-1" id="ram-detail">— / — GB</p>
+      </div>
+    </div>
+
+    <p class="section-title mb-2">Live · CPU &amp; RAM % (2 min)</p>
+    <canvas id="spark-cpu" class="sparkline-canvas"></canvas>
+  </div>
+</div>
+
+<p class="text-center text-xs text-slate-700 pb-4">
+  EfficientSAM3 Dashboard · reads TB events + logs, never touches training process
+</p>
+
+<script>
+// ── Config ────────────────────────────────────────────────────────────────────
+const SNAP_INTERVAL_MS = 2000;
+const CHART_INTERVAL_MS = 15000;
+const SPARKLINE_MAXPTS = 60; // 2 min @ 2s
+
+// ── Plotly dark layout ────────────────────────────────────────────────────────
+const PLOTLY_BASE = {
+  paper_bgcolor: 'transparent',
+  plot_bgcolor:  'rgba(15,23,42,0.5)',
+  font: { family: 'JetBrains Mono, monospace', color: '#94a3b8', size: 10 },
+  margin: { l: 40, r: 10, t: 8, b: 30 },
+  xaxis: { gridcolor: 'rgba(51,65,85,0.4)', zerolinecolor: 'rgba(51,65,85,0.4)', tickfont: { size: 9 } },
+  yaxis: { gridcolor: 'rgba(51,65,85,0.4)', zerolinecolor: 'rgba(51,65,85,0.4)', tickfont: { size: 9 } },
+  legend: { bgcolor: 'transparent', font: { size: 9 }, orientation: 'h', y: 1.15, x: 0 },
+  hovermode: 'x unified',
+  hoverlabel: { bgcolor: '#0f172a', bordercolor: '#334155', font: { family: 'JetBrains Mono', size: 10 } },
+};
+
+function layout(overrides = {}) {
+  return Object.assign({}, PLOTLY_BASE, overrides);
+}
+
+const LINE_CONFIG = { responsive: true, displayModeBar: false };
+
+// ── Chart init (empty) ────────────────────────────────────────────────────────
+Plotly.newPlot('chart-train', [
+  { name: 'total', x: [], y: [], mode: 'lines', line: { color: '#34d399', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(52,211,153,0.05)' },
+  { name: 'mse',   x: [], y: [], mode: 'lines', line: { color: '#60a5fa', width: 1.2, dash: 'dot' } },
+  { name: 'cos',   x: [], y: [], mode: 'lines', line: { color: '#c084fc', width: 1.2 } },
+], layout(), LINE_CONFIG);
+
+Plotly.newPlot('chart-val', [
+  { name: 'val',     x: [], y: [], mode: 'lines+markers', line: { color: '#fbbf24', width: 2 }, marker: { size: 5 } },
+  { name: 'val-ema', x: [], y: [], mode: 'lines+markers', line: { color: '#fb923c', width: 2, dash: 'dot' }, marker: { size: 4 } },
+], layout(), LINE_CONFIG);
+
+Plotly.newPlot('chart-lr', [
+  { name: 'lr', x: [], y: [], mode: 'lines', line: { color: '#a78bfa', width: 1.5 } },
+], layout({ yaxis: { tickformat: '.2e', gridcolor: 'rgba(51,65,85,0.4)', tickfont: { size: 9 } } }), LINE_CONFIG);
+
+Plotly.newPlot('chart-ips', [
+  { name: 'ips', x: [], y: [], mode: 'lines', line: { color: '#38bdf8', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(56,189,248,0.06)' },
+], layout(), LINE_CONFIG);
+
+// ── Sparklines ────────────────────────────────────────────────────────────────
+class Sparkline {
+  constructor(canvasId, colors) {
+    this.canvas = document.getElementById(canvasId);
+    this.ctx = this.canvas.getContext('2d');
+    this.colors = colors; // array of { data:[], color, label }
+    this.maxPts = SPARKLINE_MAXPTS;
+    for (const s of this.colors) s.data = [];
+    this._resize();
+    window.addEventListener('resize', () => this._resize());
+  }
+  _resize() {
+    const r = window.devicePixelRatio || 1;
+    const w = this.canvas.offsetWidth;
+    const h = this.canvas.offsetHeight;
+    this.canvas.width  = w * r;
+    this.canvas.height = h * r;
+    this.ctx.scale(r, r);
+    this.W = w; this.H = h;
+    this.draw();
+  }
+  push(...vals) {
+    for (let i = 0; i < this.colors.length; i++) {
+      this.colors[i].data.push(vals[i] ?? 0);
+      if (this.colors[i].data.length > this.maxPts)
+        this.colors[i].data.shift();
+    }
+    this.draw();
+  }
+  draw() {
+    const ctx = this.ctx, W = this.W, H = this.H;
+    ctx.clearRect(0, 0, W, H);
+
+    // grid lines at 25%, 50%, 75%
+    ctx.strokeStyle = 'rgba(51,65,85,0.3)';
+    ctx.lineWidth = 0.5;
+    for (const pct of [0.25, 0.5, 0.75]) {
+      const y = H - pct * H;
+      ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    }
+
+    for (const series of this.colors) {
+      if (series.data.length < 2) continue;
+      const max = Math.max(...series.data, 1);
+      const xs = series.data.map((_, i) => (i / (this.maxPts - 1)) * W);
+      const ys = series.data.map(v => H - (v / max) * H * 0.9 - H * 0.05);
+
+      // fill
+      const grad = ctx.createLinearGradient(0, 0, 0, H);
+      grad.addColorStop(0, series.color.replace(')', ',0.2)').replace('rgb', 'rgba'));
+      grad.addColorStop(1, series.color.replace(')', ',0)').replace('rgb', 'rgba'));
+      ctx.beginPath();
+      ctx.moveTo(xs[0], H);
+      xs.forEach((x, i) => ctx.lineTo(x, ys[i]));
+      ctx.lineTo(xs[xs.length-1], H);
+      ctx.closePath();
+      ctx.fillStyle = grad;
+      ctx.fill();
+
+      // line
+      ctx.beginPath();
+      xs.forEach((x, i) => i === 0 ? ctx.moveTo(x, ys[i]) : ctx.lineTo(x, ys[i]));
+      ctx.strokeStyle = series.color;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // last value label
+      const last = series.data[series.data.length - 1];
+      ctx.fillStyle = series.color;
+      ctx.font = '9px JetBrains Mono, monospace';
+      ctx.fillText(`${last.toFixed(1)}%`, W - 36, ys[ys.length-1] - 4);
+    }
+  }
+}
+
+const sparkGpu = new Sparkline('spark-gpu', [
+  { color: '#ef4444', label: 'GPU util%' },
+  { color: '#f97316', label: 'Temp (×1)' },
+]);
+const sparkCpu = new Sparkline('spark-cpu', [
+  { color: '#3b82f6', label: 'CPU%' },
+  { color: '#8b5cf6', label: 'RAM%' },
+]);
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function fmt4(v) { return v != null ? v.toFixed(4) : '—'; }
+function fmtPct(v) { return v != null ? v.toFixed(1) + '%' : '—'; }
+function fmtN(v, dec=2) { return v != null ? v.toFixed(dec) : '—'; }
+
+function el(id) { return document.getElementById(id); }
+function set(id, v) { const e = el(id); if (e) e.textContent = v; }
+
+function tempColor(t) {
+  if (t == null) return '#94a3b8';
+  if (t < 60) return '#34d399';
+  if (t < 75) return '#fbbf24';
+  if (t < 85) return '#fb923c';
+  return '#ef4444';
+}
+
+// ── Snapshot update ───────────────────────────────────────────────────────────
+async function fetchSnapshot() {
+  try {
+    const r = await fetch('/api/snapshot');
+    if (!r.ok) return;
+    const d = await r.json();
+
+    // Status pill
+    const pill = el('status-pill');
+    const alive = d.process?.alive;
+    const pid   = d.process?.pid;
+    if (alive === true) {
+      pill.className = 'pill-alive px-3 py-1 rounded-full text-xs font-semibold mono';
+      pill.textContent = `● ALIVE${pid ? ' · ' + pid : ''}`;
+    } else if (alive === false) {
+      pill.className = 'pill-dead px-3 py-1 rounded-full text-xs font-semibold mono';
+      pill.textContent = '● DEAD';
+    } else {
+      pill.className = 'pill-unknown px-3 py-1 rounded-full text-xs font-semibold mono';
+      pill.textContent = '● UNKNOWN';
+    }
+
+    // Run info
+    const run = d.run || {};
+    set('run-tag', run.tag || '—');
+    set('epoch-current', run.current_epoch ?? '—');
+    set('epoch-total', run.config_epochs ?? '—');
+    const epochPct = run.config_epochs > 0
+      ? (run.current_epoch / run.config_epochs * 100).toFixed(1) : 0;
+    el('epoch-bar').style.width = epochPct + '%';
+    set('epoch-pct', epochPct + '%');
+
+    set('iter-current', (run.current_iter ?? '—').toLocaleString());
+    set('iter-total', (run.steps_per_epoch ?? '—').toLocaleString());
+    const iterPct = run.steps_per_epoch > 0
+      ? (run.current_iter / run.steps_per_epoch * 100).toFixed(1) : 0;
+    el('iter-bar').style.width = iterPct + '%';
+    set('global-step', `global step: ${(run.global_step ?? '—').toLocaleString()}`);
+
+    // Time
+    const t = d.time || {};
+    set('elapsed', t.elapsed_human || '—');
+    set('eta', t.eta_human || '—');
+    set('epoch-avg', t.epoch_avg_human ? `avg ${t.epoch_avg_human}` : '—');
+    set('remaining-iters', t.remaining_iters != null ? `${t.remaining_iters.toLocaleString()} iters` : '—');
+
+    // Last update
+    set('last-update', new Date().toLocaleTimeString());
+
+    // Loss badges
+    const loss = d.loss || {};
+    set('badge-total', fmt4(loss.train_total));
+    set('badge-mse',   fmt4(loss.train_mse));
+    set('badge-cos',   fmt4(loss.train_cos));
+    set('badge-lr',    loss.lr != null ? loss.lr.toExponential(2) : '—');
+    set('badge-ips',   loss.ips != null ? loss.ips.toFixed(2) : '—');
+    set('badge-val',   fmt4(loss.val_total) + (loss.val_at_epoch != null ? ` ep${loss.val_at_epoch}` : ''));
+    set('badge-ema',   fmt4(loss.val_ema_total));
+    set('badge-best',  fmt4(loss.best_val));
+
+    // GPU
+    const gpu = d.system?.gpu || {};
+    set('gpu-name', gpu.name || '—');
+    set('gpu-util', gpu.util_pct != null ? gpu.util_pct + '%' : '—');
+    el('gpu-util-bar').style.width = (gpu.util_pct || 0) + '%';
+
+    const vramUsedGb = gpu.mem_used_mb != null ? (gpu.mem_used_mb / 1024).toFixed(1) : '—';
+    const vramTotalGb = gpu.mem_total_mb != null ? (gpu.mem_total_mb / 1024).toFixed(1) : '—';
+    set('gpu-vram', vramUsedGb + ' GB');
+    set('gpu-vram-total', '/ ' + vramTotalGb + ' GB');
+    const vramPct = gpu.mem_total_mb > 0 ? gpu.mem_used_mb / gpu.mem_total_mb * 100 : 0;
+    el('gpu-vram-bar').style.width = vramPct + '%';
+
+    set('gpu-power', gpu.power_w != null ? Math.round(gpu.power_w) + ' W' : '—');
+    set('gpu-fan',   gpu.fan_pct != null ? gpu.fan_pct + '%' : '—');
+
+    const tempBadge = el('gpu-temp-badge');
+    if (gpu.temp_c != null) {
+      tempBadge.textContent = gpu.temp_c + '°C';
+      tempBadge.style.color = tempColor(gpu.temp_c);
+      tempBadge.style.background = 'rgba(15,23,42,0.8)';
+      tempBadge.style.border = `1px solid ${tempColor(gpu.temp_c)}44`;
+    }
+
+    // CPU / RAM
+    const cpu = d.system?.cpu || {};
+    const ram = d.system?.ram || {};
+    set('cpu-util', fmtPct(cpu.util_pct));
+    el('cpu-util-bar').style.width = (cpu.util_pct || 0) + '%';
+    set('cpu-load', `load ${cpu.load_1m ?? '—'} · ${cpu.load_5m ?? '—'} · ${cpu.load_15m ?? '—'}`);
+    set('ram-util', fmtPct(ram.pct));
+    el('ram-util-bar').style.width = (ram.pct || 0) + '%';
+    set('ram-detail', `${ram.used_gb ?? '—'} / ${ram.total_gb ?? '—'} GB`);
+
+    // Sparklines
+    sparkGpu.push(gpu.util_pct ?? 0, gpu.temp_c ?? 0);
+    sparkCpu.push(cpu.util_pct ?? 0, ram.pct ?? 0);
+
+  } catch(e) {
+    console.error('snapshot error', e);
+  }
+}
+
+// ── Chart update ──────────────────────────────────────────────────────────────
+async function fetchCharts() {
+  const tags = ['train/loss_total','train/loss_mse','train/loss_cosine','train/lr','train/ips','val/loss_total','val/ema_loss_total'];
+  try {
+    const results = await Promise.all(tags.map(tag =>
+      fetch(`/api/scalars?tag=${encodeURIComponent(tag)}&downsample=500`).then(r => r.json())
+    ));
+
+    const byTag = {};
+    tags.forEach((t, i) => byTag[t] = results[i]);
+
+    function pts(tag) {
+      const d = byTag[tag];
+      return { x: d?.steps || [], y: d?.values || [] };
+    }
+
+    const train = pts('train/loss_total');
+    const mse   = pts('train/loss_mse');
+    const cos   = pts('train/loss_cosine');
+    const lr    = pts('train/lr');
+    const ips   = pts('train/ips');
+    const val   = pts('val/loss_total');
+    const ema   = pts('val/ema_loss_total');
+
+    Plotly.react('chart-train', [
+      { name: 'total', x: train.x, y: train.y, mode: 'lines', line: { color: '#34d399', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(52,211,153,0.05)' },
+      { name: 'mse',   x: mse.x,   y: mse.y,   mode: 'lines', line: { color: '#60a5fa', width: 1.2, dash: 'dot' } },
+      { name: 'cos',   x: cos.x,   y: cos.y,   mode: 'lines', line: { color: '#c084fc', width: 1.2 } },
+    ], layout(), LINE_CONFIG);
+
+    Plotly.react('chart-val', [
+      { name: 'val',     x: val.x, y: val.y, mode: 'lines+markers', line: { color: '#fbbf24', width: 2 }, marker: { size: 5 } },
+      { name: 'val-ema', x: ema.x, y: ema.y, mode: 'lines+markers', line: { color: '#fb923c', width: 2, dash: 'dot' }, marker: { size: 4 } },
+    ], layout(), LINE_CONFIG);
+
+    Plotly.react('chart-lr', [
+      { name: 'lr', x: lr.x, y: lr.y, mode: 'lines', line: { color: '#a78bfa', width: 1.5 } },
+    ], layout({ yaxis: { tickformat: '.2e', gridcolor: 'rgba(51,65,85,0.4)', tickfont: { size: 9 } } }), LINE_CONFIG);
+
+    Plotly.react('chart-ips', [
+      { name: 'ips', x: ips.x, y: ips.y, mode: 'lines', line: { color: '#38bdf8', width: 1.5 }, fill: 'tozeroy', fillcolor: 'rgba(56,189,248,0.06)' },
+    ], layout(), LINE_CONFIG);
+
+  } catch(e) {
+    console.error('chart error', e);
+  }
+}
+
+// ── Boot ──────────────────────────────────────────────────────────────────────
+// Pre-warm psutil CPU percentage measurement
+fetch('/api/snapshot');
+setTimeout(() => {
+  fetchSnapshot();
+  fetchCharts();
+}, 500);
+
+setInterval(fetchSnapshot, SNAP_INTERVAL_MS);
+setInterval(fetchCharts, CHART_INTERVAL_MS);
+</script>
+</body>
+</html>

@@ -29,6 +29,45 @@ def _trainable_state_dict(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
     return {k: v for k, v in full.items() if k in trainable_names}
 
 
+def _backbone_bn_buffers(model: torch.nn.Module) -> Dict[str, torch.Tensor]:
+    """Collect BN running stats from frozen backbone submodules.
+
+    BN running_mean/running_var/num_batches_tracked are buffers (not params),
+    so _trainable_state_dict misses them. Without these, standalone eval gets
+    Stage-1 BN stats instead of the SA-V-accumulated stats from training,
+    causing backbone feature distribution shift → Perceiver produces cos_sim≈0.
+    """
+    bn_types = (
+        torch.nn.BatchNorm1d, torch.nn.BatchNorm2d,
+        torch.nn.BatchNorm3d, torch.nn.SyncBatchNorm,
+    )
+    frozen_backbone_attrs = ('vision_backbone', 'conv_s0', 'conv_s1')
+    out: Dict[str, torch.Tensor] = {}
+    for attr in frozen_backbone_attrs:
+        sub = getattr(model, attr, None)
+        if sub is None:
+            continue
+        for name, mod in sub.named_modules():
+            if isinstance(mod, bn_types):
+                prefix = f"{attr}.{name}." if name else f"{attr}."
+                for buf_name in ('running_mean', 'running_var', 'num_batches_tracked'):
+                    buf = getattr(mod, buf_name, None)
+                    if buf is not None:
+                        out[prefix + buf_name] = buf.cpu()
+    return out
+
+
+def _load_backbone_bn_buffers(
+    model: torch.nn.Module, buffers: Dict[str, torch.Tensor], device=None
+) -> None:
+    """Restore BN running stats saved by _backbone_bn_buffers."""
+    sd = model.state_dict()
+    for key, val in buffers.items():
+        if key in sd:
+            sd[key] = val.to(sd[key].device)
+    model.load_state_dict(sd, strict=False)
+
+
 def _build_payload(
     *,
     config,
@@ -47,6 +86,7 @@ def _build_payload(
         'global_step': global_step,
         'step_in_epoch': step_in_epoch,
         'model_trainable': _trainable_state_dict(model),
+        'backbone_bn_buffers': _backbone_bn_buffers(model),
         'optimizer': optimizer.state_dict(),
         'scheduler_iter': getattr(scheduler, '_iter', global_step),
         'scaler': scaler.state_dict() if (scaler is not None and scaler.is_enabled()) else None,
@@ -159,6 +199,9 @@ def load_checkpoint(
     missing = [k for k in msg.missing_keys if k in {n for n, p in model.named_parameters() if p.requires_grad}]
     if missing:
         raise RuntimeError(f"Missing trainable keys when loading {path}: {missing[:8]}")
+
+    if 'backbone_bn_buffers' in payload and payload['backbone_bn_buffers']:
+        _load_backbone_bn_buffers(model, payload['backbone_bn_buffers'], map_location)
 
     if optimizer is not None and 'optimizer' in payload:
         optimizer.load_state_dict(payload['optimizer'])
