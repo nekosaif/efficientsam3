@@ -6,8 +6,8 @@ DATA:
   SAV_TAR_DIR: /mnt/hdd/datasets/SA-V/
   SAV_INDEX_CACHE: data/sav_index.pkl
   BATCH_SIZE: 2
-  NUM_WORKERS: 28
-  PREFETCH_FACTOR: 4
+  NUM_WORKERS: 16          # was 28; 16 phys cores on Ryzen 9 9950X. Reduces dataloader RSS by ~43%.
+  PREFETCH_FACTOR: 2       # was 4. Halves in-flight batch queue (~14 GB → ~7 GB).
   PIN_MEMORY: true
   PERSISTENT_WORKERS: true
   IMG_SIZE: 1008
@@ -28,7 +28,7 @@ DISTILL:
   ENABLED: true
   MSE_WEIGHT: 1.0
   COSINE_WEIGHT: 1.0
-  NORM_WEIGHT: 0.25
+  NORM_WEIGHT: 2.0         # was 0.25 — ep50_run2 collapsed mlp_out to 50x init scale; 8x stronger.
   FEATURE_DIM: 256
 
 TRAIN:
@@ -37,14 +37,15 @@ TRAIN:
   BASE_LR: 1.0e-4
   WARMUP_LR: 1.0e-7
   MIN_LR: 1.0e-6
-  WEIGHT_DECAY: 0.05
-  CLIP_GRAD: 1.0
+  WEIGHT_DECAY: 0.1        # was 0.05 — extra decay pressure on mlp_out/out_attn weights (ndim>=2).
+  CLIP_GRAD: 0.5           # was 1.0 — tighter cap to keep optimizer steps from runaway updates.
   AUTO_RESUME: true
   AMP_DTYPE: bfloat16
   ACCUMULATION_STEPS: 1
+  SAVE_EVERY_ITERS: 2000   # mid-epoch atomic ckpt every ~12 min; caps SIGKILL loss.
 
 EVAL:
-  EVERY_N_EPOCHS: 5
+  EVERY_N_EPOCHS: 1        # was 5 — catch any collapse mode within the first epoch boundary.
 
 AMP_ENABLE: true
 SAVE_FREQ: 1

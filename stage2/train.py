@@ -64,6 +64,11 @@ def parse_option():
     parser.add_argument('--disable_amp', action='store_true')
     parser.add_argument('--only-cpu', action='store_true')
     parser.add_argument('--eval', action='store_true', help='run eval only, no training')
+    parser.add_argument('--eval-on-train', action='store_true',
+                        help='in --eval mode, use the train loader instead of val. '
+                             'Diagnostic: does the model reproduce training-time loss on its '
+                             'own train distribution? If yes, the train/val gap is a real '
+                             'generalization failure rather than an eval-path bug.')
     parser.add_argument('--no-val', action='store_true', help='skip held-out val eval during training')
     parser.add_argument('--val-max-batches', type=int, default=-1,
                         help='cap val batches per eval; -1 = full val set')
@@ -235,17 +240,25 @@ def main():
 
     # -- eval-only mode -----------------------------------------------------
     if args.eval:
-        if loader_val is None:
-            log("[stage2] --eval set but no val loader (use without --no-val)")
+        if args.eval_on_train:
+            eval_loader = loader_train
+            # set_epoch on the sampler so shuffle is deterministic across runs
+            eval_loader.sampler.set_epoch(0)
+            eval_split_label = 'train'
+        else:
+            eval_loader = loader_val
+            eval_split_label = 'val'
+        if eval_loader is None:
+            log(f"[stage2] --eval set but no {eval_split_label} loader (use without --no-val)")
             return
         result = evaluate_distill(
-            student=student.module, teacher=teacher, loader=loader_val,
+            student=student.module, teacher=teacher, loader=eval_loader,
             loss_fn=loss_fn, device=device, amp_dtype=amp_dtype,
             use_amp=use_amp, max_batches=args.val_max_batches,
             calibrate_bn_batches=args.calibrate_bn_batches,
             backbone_bn_train_mode=args.backbone_bn_train_mode,
         )
-        log(f"[stage2][eval] total={result.total:.4f} mse={result.mse:.4f} "
+        log(f"[stage2][eval:{eval_split_label}] total={result.total:.4f} mse={result.mse:.4f} "
             f"cos={result.cosine:.4f} norm={result.norm:.4f} n={result.n_batches}")
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -300,14 +313,17 @@ def main():
 
             n_window += frames.shape[0]
 
+            grad_norm_val: float | None = None
+            mlp_out_w_std_val: float | None = None
             if (step + 1) % accum == 0:
                 if config.TRAIN.CLIP_GRAD > 0:
                     if scaler.is_enabled():
                         scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
+                    grad_norm_t = torch.nn.utils.clip_grad_norm_(
                         [p for p in student.parameters() if p.requires_grad],
                         max_norm=config.TRAIN.CLIP_GRAD,
                     )
+                    grad_norm_val = float(grad_norm_t.item()) if grad_norm_t is not None else None
                 if scaler.is_enabled():
                     scaler.step(optimizer); scaler.update()
                 else:
@@ -317,6 +333,11 @@ def main():
                 scheduler.step(global_step)
                 if ema_perceiver is not None:
                     ema_perceiver.update(student.module.perceiver)
+                # collapse early-warning: snapshot mlp_out.2.weight magnitude
+                with torch.no_grad():
+                    mlp_out_w_std_val = float(
+                        student.module.perceiver.mlp_out[2].weight.float().std().item()
+                    )
 
             # mid-epoch checkpoint (rank 0 only); guards against SIGHUP/preempt
             save_every = int(config.TRAIN.SAVE_EVERY_ITERS)
@@ -333,11 +354,19 @@ def main():
             if step % config.PRINT_FREQ == 0:
                 dt = max(1e-6, time.time() - t_window)
                 ips = n_window / dt
+                # collapse early-warning: avg per-token L2 norm of student output
+                with torch.no_grad():
+                    s_token_norm_val = float(
+                        s_out.detach().float().norm(p=2, dim=2).mean().item()
+                    )
+                gn_str = f"gn={grad_norm_val:.3f}" if grad_norm_val is not None else "gn=--"
+                mw_str = f"mw={mlp_out_w_std_val:.3f}" if mlp_out_w_std_val is not None else "mw=--"
                 log(f"[stage2] ep{epoch} it{step}/{len(loader_train)} "
                     f"loss={losses.total.item():.4f} mse={losses.mse.item():.4f} "
                     f"cos={losses.cosine.item():.4f} norm={losses.norm.item():.4f} "
                     f"lr={scheduler.get_lr():.2e} "
-                    f"ips={ips:.2f} mask_sum={attn_mask.sum().item()}")
+                    f"ips={ips:.2f} mask_sum={attn_mask.sum().item()} "
+                    f"{gn_str} {mw_str} s_norm={s_token_norm_val:.2f}")
                 # note: ips = samples/sec (n_window += batch_size); iter/s = ips / batch_size
                 if writer is not None:
                     writer.add_scalar('train/loss_total', losses.total.item(), global_step)
@@ -346,6 +375,11 @@ def main():
                     writer.add_scalar('train/loss_norm', losses.norm.item(), global_step)
                     writer.add_scalar('train/lr', scheduler.get_lr(), global_step)
                     writer.add_scalar('train/ips', ips, global_step)
+                    if grad_norm_val is not None:
+                        writer.add_scalar('train/grad_norm', grad_norm_val, global_step)
+                    if mlp_out_w_std_val is not None:
+                        writer.add_scalar('train/mlp_out_w_std', mlp_out_w_std_val, global_step)
+                    writer.add_scalar('train/s_token_norm', s_token_norm_val, global_step)
                 t_window = time.time(); n_window = 0
 
             if args.smoke_test and step + 1 >= args.smoke_iters:

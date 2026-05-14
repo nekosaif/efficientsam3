@@ -12,10 +12,29 @@ from typing import Any
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent
-LOG_PATH = PROJECT_ROOT / "logs" / "stage2_run2.log"
-TB_DIR = PROJECT_ROOT / "output" / "efficient_sam3_stage2" / "ep50_run2" / "tb"
 CONFIG_PATH = PROJECT_ROOT / "stage2" / "configs" / "sav_repvit_m0_9.yaml"
-RUN_TAG = "ep50_run2"
+
+
+def _resolve_run_tag() -> str:
+    """Pick run tag. Override via env STAGE2_DASHBOARD_TAG; else newest run dir
+    with a matching log file; else 'ep50_run3' as a final default."""
+    env_tag = os.environ.get("STAGE2_DASHBOARD_TAG", "").strip()
+    if env_tag:
+        return env_tag
+    runs_root = PROJECT_ROOT / "output" / "efficient_sam3_stage2"
+    if runs_root.is_dir():
+        candidates = [d for d in runs_root.iterdir() if d.is_dir()]
+        if candidates:
+            # newest by mtime
+            candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            return candidates[0].name
+    return "ep50_run3"
+
+
+RUN_TAG = _resolve_run_tag()
+_short = RUN_TAG.replace("ep50_", "") if RUN_TAG.startswith("ep50_") else RUN_TAG
+LOG_PATH = PROJECT_ROOT / "logs" / f"stage2_{_short}.log"
+TB_DIR = PROJECT_ROOT / "output" / "efficient_sam3_stage2" / RUN_TAG / "tb"
 
 # Cache for TB accumulator
 _tb_cache: dict[str, Any] = {"mtime": 0.0, "data": {}}

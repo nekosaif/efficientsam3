@@ -71,7 +71,15 @@ def evaluate_distill(
                 with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                     student(frames, attn)
 
-    student.eval()
+    import os as _os
+    skip_eval_mode = _os.environ.get('STAGE2_EVAL_NO_EVAL_MODE', '0') == '1'
+    if skip_eval_mode:
+        # Diagnostic: keep student in train mode (Perceiver in train mode,
+        # backbone still in eval via StudentTemporalModel.train() override).
+        # This is what the training loop sees per step.
+        student.train()
+    else:
+        student.eval()
     # For legacy ep1-ep17 checkpoints: backbone BN was always in train mode
     # during training. Re-force train mode so eval uses per-batch stats,
     # matching the distribution the Perceiver was trained on.
@@ -80,6 +88,13 @@ def evaluate_distill(
 
     sums = torch.zeros(4, device=device, dtype=torch.float64)  # total, mse, cos, norm
     n = torch.zeros((), device=device, dtype=torch.float64)
+
+    import os
+    debug_per_batch = os.environ.get('STAGE2_EVAL_DEBUG', '0') == '1'
+    no_amp = os.environ.get('STAGE2_EVAL_NO_AMP', '0') == '1'
+    if no_amp:
+        use_amp = False
+        print('[eval-debug] AMP disabled for diagnostic', flush=True)
 
     for i, batch in enumerate(loader):
         if 0 < max_batches <= i:
@@ -93,6 +108,17 @@ def evaluate_distill(
             s_out = student(frames, attn)
             t_out = teacher(frames, attn, gt_masks, mask_valid)
             losses = loss_fn(s_out, t_out, attn)
+
+        if debug_per_batch:
+            attn_sum = int(attn.sum().item())
+            mv_sum = int(mask_valid.sum().item())
+            s_norm = float(s_out.float().norm(p=2, dim=2).mean().item())
+            t_norm = float(t_out.float().norm(p=2, dim=2).mean().item())
+            print(f"[eval-debug] batch={i} attn_sum={attn_sum} mv_sum={mv_sum} "
+                  f"s_norm={s_norm:.4f} t_norm={t_norm:.4f} "
+                  f"total={losses.total.item():.4f} mse={losses.mse.item():.4f} "
+                  f"cos={losses.cosine.item():.4f} norm={losses.norm.item():.4f}",
+                  flush=True)
 
         sums[0] += losses.total.detach().double()
         sums[1] += losses.mse.detach().double()

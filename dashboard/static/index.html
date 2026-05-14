@@ -78,6 +78,35 @@
   .temp-badge {
     padding: 2px 8px; border-radius: 6px; font-size: 0.8rem; font-weight: 600; mono;
   }
+  .ctrl-btn {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 6px 14px; border-radius: 8px;
+    font-size: 0.8rem; font-weight: 600; letter-spacing: 0.02em;
+    transition: all 0.2s ease;
+    cursor: pointer; border: 1px solid transparent;
+  }
+  .ctrl-btn:disabled { opacity: 0.35; cursor: not-allowed; }
+  .ctrl-btn-start {
+    background: rgba(16,185,129,0.15); color: #34d399;
+    border-color: rgba(16,185,129,0.35);
+  }
+  .ctrl-btn-start:hover:not(:disabled) {
+    background: rgba(16,185,129,0.25); border-color: rgba(16,185,129,0.6);
+  }
+  .ctrl-btn-stop {
+    background: rgba(239,68,68,0.15); color: #f87171;
+    border-color: rgba(239,68,68,0.35);
+  }
+  .ctrl-btn-stop:hover:not(:disabled) {
+    background: rgba(239,68,68,0.3); border-color: rgba(239,68,68,0.6);
+  }
+  .ctrl-input {
+    background: rgba(15,23,42,0.6); border: 1px solid rgba(51,65,85,0.6);
+    border-radius: 6px; padding: 4px 8px;
+    color: #cbd5e1; font-family: 'JetBrains Mono', monospace; font-size: 0.75rem;
+    width: 140px;
+  }
+  .ctrl-input:focus { outline: none; border-color: rgba(96,165,250,0.6); }
 </style>
 </head>
 <body class="min-h-screen text-slate-100 p-4">
@@ -97,6 +126,31 @@
     <span class="text-xs text-slate-500 mono" id="last-update">—</span>
     <span id="status-pill" class="pill-unknown px-3 py-1 rounded-full text-xs font-semibold mono">● UNKNOWN</span>
   </div>
+</div>
+
+<!-- Training control bar -->
+<div class="card p-3 mb-4 flex items-center flex-wrap gap-3">
+  <p class="section-title mr-2">Training Control</p>
+
+  <button id="btn-train-start" class="ctrl-btn ctrl-btn-start" onclick="trainStart()" disabled>
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><polygon points="6 4 20 12 6 20"/></svg>
+    <span id="btn-train-start-label">Start</span>
+  </button>
+
+  <button id="btn-train-stop" class="ctrl-btn ctrl-btn-stop" onclick="trainStop()" disabled>
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="6" width="12" height="12"/></svg>
+    <span>Stop</span>
+  </button>
+
+  <div class="h-6 w-px bg-slate-700 mx-1"></div>
+
+  <label class="text-xs text-slate-500 mono">tag:</label>
+  <input id="ctrl-tag" class="ctrl-input" value="ep50_run3" spellcheck="false"/>
+
+  <label class="text-xs text-slate-500 mono">port:</label>
+  <input id="ctrl-port" class="ctrl-input" value="29510" type="number" min="1024" max="65535" style="width:80px"/>
+
+  <span id="train-status-info" class="text-xs text-slate-500 mono ml-auto">— checking —</span>
 </div>
 
 <!-- Top stat cards -->
@@ -567,6 +621,103 @@ setTimeout(() => {
 
 setInterval(fetchSnapshot, SNAP_INTERVAL_MS);
 setInterval(fetchCharts, CHART_INTERVAL_MS);
+
+// ── Training process control ──────────────────────────────────────────────────
+const TRAIN_STATUS_INTERVAL_MS = 5000;
+
+function _currentTag() {
+  const el = document.getElementById('ctrl-tag');
+  return (el && el.value.trim()) || 'ep50_run3';
+}
+
+async function refreshTrainStatus() {
+  const startBtn = document.getElementById('btn-train-start');
+  const stopBtn = document.getElementById('btn-train-stop');
+  const startLbl = document.getElementById('btn-train-start-label');
+  const info = document.getElementById('train-status-info');
+  const tag = _currentTag();
+  try {
+    const r = await fetch('/api/train/status?tag=' + encodeURIComponent(tag));
+    const s = await r.json();
+    if (s.alive) {
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      startLbl.textContent = 'Start';
+      info.textContent = 'RUNNING · pid ' + s.pid + ' · tag ' + (s.tag || '?');
+      info.className = 'text-xs text-emerald-400 mono ml-auto';
+    } else {
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      startLbl.textContent = s.has_resumable_ckpt ? 'Continue' : 'Start';
+      const note = s.has_resumable_ckpt ? '  (will auto-resume)' : '  (fresh)';
+      info.textContent = 'idle' + note;
+      info.className = 'text-xs text-slate-500 mono ml-auto';
+    }
+  } catch (e) {
+    info.textContent = 'status fetch failed: ' + e.message;
+    info.className = 'text-xs text-rose-400 mono ml-auto';
+  }
+}
+
+async function trainStart() {
+  const tag = _currentTag();
+  const port = parseInt(document.getElementById('ctrl-port').value, 10) || 29510;
+  const msg = 'Launch torchrun stage2 training?\n\n'
+            + '  tag=' + tag + '\n'
+            + '  port=' + port + '\n'
+            + '  cfg=stage2/configs/sav_repvit_m0_9.yaml\n\n'
+            + 'Resumes from latest checkpoint if one exists for this tag.\n'
+            + 'Wall-clock ~5.3 h/epoch, target 50 epochs.';
+  if (!confirm(msg)) return;
+
+  const btn = document.getElementById('btn-train-start');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/train/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ tag: tag, master_port: port }),
+    });
+    const data = await r.json();
+    if (r.ok) {
+      alert('✓ Launched\n\npid=' + data.pid + '\nlog=' + data.log
+            + (data.resumed ? '\n\n(auto-resuming from existing checkpoint)' : ''));
+    } else {
+      alert('✗ Start failed: ' + (data.detail || r.statusText));
+    }
+  } catch (e) {
+    alert('✗ Start error: ' + e.message);
+  } finally {
+    refreshTrainStatus();
+  }
+}
+
+async function trainStop() {
+  if (!confirm('STOP training?\n\nGraceful SIGTERM first; SIGKILL after 10 s if still alive.\n'
+             + 'Mid-epoch state is persisted to ckpt_running.pth (if SAVE_EVERY_ITERS > 0).')) return;
+  if (!confirm('Are you sure? Last chance.')) return;
+
+  const btn = document.getElementById('btn-train-stop');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/train/stop', { method: 'POST' });
+    const data = await r.json();
+    if (r.ok && data.ok) {
+      const how = data.killed_with_sigkill ? 'SIGKILL (graceful timeout)' : 'SIGTERM';
+      alert('✓ Stopped\n\npid=' + data.pid + '\nsignal=' + how);
+    } else {
+      alert('✗ Stop failed: ' + (data.detail || r.statusText));
+    }
+  } catch (e) {
+    alert('✗ Stop error: ' + e.message);
+  } finally {
+    refreshTrainStatus();
+  }
+}
+
+document.getElementById('ctrl-tag').addEventListener('change', refreshTrainStatus);
+refreshTrainStatus();
+setInterval(refreshTrainStatus, TRAIN_STATUS_INTERVAL_MS);
 </script>
 </body>
 </html>

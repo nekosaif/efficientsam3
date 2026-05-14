@@ -2,17 +2,19 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-VENV=.venv
-PORT=6009
+VENV=/home/saif/venvs/tf
+PORT=6007
 LOGFILE=logs/dashboard.log
 PIDFILE=logs/dashboard.pid
 
-# Stop existing instance
+# Stop existing instance (best-effort, kill anything still on the port).
 if [ -f "$PIDFILE" ]; then
   OLD_PID=$(cat "$PIDFILE")
   kill "$OLD_PID" 2>/dev/null || true
   sleep 1
 fi
+pkill -f "uvicorn dashboard.server:app" 2>/dev/null || true
+sleep 1
 
 nohup "$VENV/bin/python" -m uvicorn dashboard.server:app \
   --host 0.0.0.0 --port "$PORT" \
