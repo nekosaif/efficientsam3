@@ -68,7 +68,8 @@ def main():
     mask = torch.ones(1, MAX_FRAMES, dtype=torch.bool, device=device)
 
     autocast_dtype = torch.bfloat16 if device.type == 'cuda' else torch.float32
-    with torch.amp.autocast('cuda', dtype=autocast_dtype, enabled=(device.type == 'cuda')):
+    with torch.amp.autocast('cuda', dtype=autocast_dtype, enabled=(device.type == 'cuda'),
+                            cache_enabled=False):
         t0 = time.time()
         s_out = student(frames, mask)
         print(f"[student] forward: {time.time()-t0:.2f}s  out={tuple(s_out.shape)}")

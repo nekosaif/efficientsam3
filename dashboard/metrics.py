@@ -59,31 +59,48 @@ def _load_config() -> dict:
     return _config_cache
 
 
-def _active_tb_file() -> Path | None:
+def _all_tb_files() -> list[Path]:
     if not TB_DIR.exists():
-        return None
-    files = sorted(TB_DIR.glob("events.out.tfevents.*"), key=lambda p: p.stat().st_mtime)
+        return []
+    return sorted(TB_DIR.glob("events.out.tfevents.*"), key=lambda p: p.stat().st_mtime)
+
+
+def _active_tb_file() -> Path | None:
+    files = _all_tb_files()
     return files[-1] if files else None
 
 
 def _load_tb_scalars() -> dict[str, list]:
-    """Return dict tag -> list of (step, value). Cached by mtime."""
-    f = _active_tb_file()
-    if f is None:
+    """Return dict tag -> list of (step, value). Cached by the newest file's mtime.
+
+    Reads EVERY event file in TB_DIR and merges series across them (training
+    restarts each produce a new tfevents file). Within each tag the points are
+    sorted by step and de-duplicated keeping the last value for each step.
+    """
+    files = _all_tb_files()
+    if not files:
         return {}
-    mtime = f.stat().st_mtime
-    if mtime == _tb_cache["mtime"] and _tb_cache["data"]:
+    mtime = max(f.stat().st_mtime for f in files)
+    n_files = len(files)
+    cached_n = _tb_cache.get("n_files", 0)
+    if mtime == _tb_cache["mtime"] and n_files == cached_n and _tb_cache["data"]:
         return _tb_cache["data"]
 
     try:
         from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-        ea = EventAccumulator(str(f), size_guidance={"scalars": 0})
-        ea.Reload()
-        data: dict[str, list] = {}
-        for tag in ea.Tags().get("scalars", []):
-            events = ea.Scalars(tag)
-            data[tag] = [(e.step, e.value) for e in events]
+        per_tag: dict[str, dict[int, float]] = {}
+        for f in files:
+            ea = EventAccumulator(str(f), size_guidance={"scalars": 0})
+            ea.Reload()
+            for tag in ea.Tags().get("scalars", []):
+                bucket = per_tag.setdefault(tag, {})
+                for e in ea.Scalars(tag):
+                    bucket[e.step] = e.value  # later files overwrite same step
+        data: dict[str, list] = {
+            tag: sorted(bucket.items()) for tag, bucket in per_tag.items()
+        }
         _tb_cache["mtime"] = mtime
+        _tb_cache["n_files"] = n_files
         _tb_cache["data"] = data
         return data
     except Exception:
@@ -272,6 +289,44 @@ def get_snapshot() -> dict:
     cur_epoch = log["current_epoch"]
     cur_iter = log["current_iter"]
 
+    # Fall back to TB scalars when the log parser found nothing — happens
+    # right after a relaunch where the log was rotated and the new file is
+    # still in the dataloader skip-first phase (no train-iter prints yet).
+    # IMPORTANT: read from `log` but write to LOCAL variables. The log parser
+    # has a 2s cache; mutating the returned dict would poison the next call
+    # (the `is None` check would be False, but cur_epoch/cur_iter would still
+    # be 0 from the cached parse → epoch/iter flicker on the dashboard).
+    tb_data: dict[str, list] | None = None
+    def _tb():
+        nonlocal tb_data
+        if tb_data is None:
+            tb_data = _load_tb_scalars()
+        return tb_data
+    def _last_val(tag):
+        pts = _tb().get(tag, [])
+        return pts[-1][1] if pts else None
+    def _last_step(tag):
+        pts = _tb().get(tag, [])
+        return pts[-1][0] if pts else None
+
+    train_loss = log["train_loss"]
+    train_mse  = log["train_mse"]
+    train_cos  = log["train_cos"]
+    lr         = log["lr"]
+    ips        = log["ips"]
+
+    if train_loss is None:
+        # the last TB step is the global_step at which it was written
+        tb_step = _last_step("train/loss_total")
+        if tb_step is not None and steps_per_epoch > 0:
+            cur_epoch = tb_step // steps_per_epoch
+            cur_iter = tb_step % steps_per_epoch
+        train_loss = _last_val("train/loss_total")
+        train_mse  = _last_val("train/loss_mse")
+        train_cos  = _last_val("train/loss_cosine")
+        lr         = _last_val("train/lr")
+        ips        = _last_val("train/ips")
+
     # cur_epoch is 0-indexed (train.py: for epoch in range(0, total_epochs))
     # ep0 = first epoch, ep49 = last epoch for a 50-epoch run
     completed_epochs = cur_epoch  # ep{N} means epochs 0..N-1 are done
@@ -350,11 +405,11 @@ def get_snapshot() -> dict:
             "pct_done": round(pct_done, 2),
         },
         "loss": {
-            "train_total": log["train_loss"],
-            "train_mse": log["train_mse"],
-            "train_cos": log["train_cos"],
-            "lr": log["lr"],
-            "ips": log["ips"],
+            "train_total": train_loss,
+            "train_mse": train_mse,
+            "train_cos": train_cos,
+            "lr": lr,
+            "ips": ips,
             "val_total": val_total,
             "val_mse": val_mse,
             "val_cos": val_cos,

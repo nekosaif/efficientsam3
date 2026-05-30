@@ -1,0 +1,16 @@
+[Unit]
+Description=Watchdog: remount /mnt/hdd if it disappears
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mnt-hdd-watchdog.sh
+Restart=always
+RestartSec=10
+# allow mount(8) without an interactive shell
+PrivateNetwork=no
+PrivateUsers=no
+ProtectSystem=no
+
+[Install]
+WantedBy=multi-user.target

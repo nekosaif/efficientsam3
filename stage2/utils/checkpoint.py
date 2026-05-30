@@ -80,6 +80,7 @@ def _build_payload(
     best_val,
     ema=None,
     step_in_epoch: int = 0,
+    epochs_since_best: int = 0,
 ) -> Dict:
     return {
         'epoch': epoch,
@@ -92,6 +93,7 @@ def _build_payload(
         'scaler': scaler.state_dict() if (scaler is not None and scaler.is_enabled()) else None,
         'ema': ema.state_dict() if ema is not None else None,
         'best_val': best_val,
+        'epochs_since_best': epochs_since_best,
         'config': config.dump() if hasattr(config, 'dump') else str(config),
     }
 
@@ -108,6 +110,7 @@ def save_checkpoint(
     best_val: Optional[float],
     is_best: bool = False,
     ema=None,
+    epochs_since_best: int = 0,
 ):
     out_dir = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG)
     os.makedirs(out_dir, exist_ok=True)
@@ -116,6 +119,7 @@ def save_checkpoint(
         config=config, epoch=epoch, global_step=global_step,
         model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
         best_val=best_val, ema=ema, step_in_epoch=0,
+        epochs_since_best=epochs_since_best,
     )
 
     path = os.path.join(out_dir, f'ckpt_epoch_{epoch}.pth')
@@ -159,6 +163,7 @@ def save_running_checkpoint(
     scaler: Optional[torch.amp.GradScaler],
     best_val: Optional[float],
     ema=None,
+    epochs_since_best: int = 0,
 ) -> str:
     """Mid-epoch save. Single overwriting file (ckpt_running.pth).
 
@@ -172,6 +177,7 @@ def save_running_checkpoint(
         config=config, epoch=epoch, global_step=global_step,
         model=model, optimizer=optimizer, scheduler=scheduler, scaler=scaler,
         best_val=best_val, ema=ema, step_in_epoch=step_in_epoch,
+        epochs_since_best=epochs_since_best,
     )
 
     path = os.path.join(out_dir, 'ckpt_running.pth')
@@ -217,6 +223,7 @@ def load_checkpoint(
         'global_step': int(payload.get('global_step', 0)),
         'step_in_epoch': int(payload.get('step_in_epoch', 0)),
         'best_val': payload.get('best_val'),
+        'epochs_since_best': int(payload.get('epochs_since_best', 0)),
         'has_ema': payload.get('ema') is not None,
     }
 

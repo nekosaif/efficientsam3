@@ -84,6 +84,10 @@ _C.TRAIN.FIND_UNUSED_PARAMETERS = False
 # 0 = off (epoch-only saves). Suggested 1000–2000 for SA-V scale.
 _C.TRAIN.SAVE_EVERY_ITERS = 0
 
+# Early stopping. 0 = disabled. N = stop after N consecutive epochs with no
+# new best val_total. Evaluated only on val epochs (EVAL.EVERY_N_EPOCHS-aware).
+_C.TRAIN.EARLY_STOP_PATIENCE = 0
+
 # Weights EMA on Perceiver only (~5M params). Used for val-time smoothing.
 # NOT a teacher — teacher is the frozen SAM3 ViT-H.
 _C.TRAIN.EMA_ENABLE = True

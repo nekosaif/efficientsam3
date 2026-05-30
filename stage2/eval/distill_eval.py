@@ -68,7 +68,8 @@ def evaluate_distill(
                     break
                 frames = batch['frames'].to(device, non_blocking=True)
                 attn = batch['attention_mask'].to(device, non_blocking=True)
-                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+                with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp,
+                                        cache_enabled=False):
                     student(frames, attn)
 
     import os as _os
@@ -104,7 +105,11 @@ def evaluate_distill(
         gt_masks = batch['masks'].to(device, non_blocking=True)
         mask_valid = batch['mask_valid'].to(device, non_blocking=True)
 
-        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+        # cache_enabled=False — match the production training context. Stale
+        # bf16 weight cache otherwise gives different forward output than the
+        # training-time forward. See debug_definitive.py for the proof.
+        with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp,
+                                cache_enabled=False):
             s_out = student(frames, attn)
             t_out = teacher(frames, attn, gt_masks, mask_valid)
             losses = loss_fn(s_out, t_out, attn)

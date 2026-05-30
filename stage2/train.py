@@ -201,6 +201,9 @@ def main():
     step_in_epoch_resume = 0
     global_step = 0
     best_val: float | None = None
+    # early-stopping counter — incremented at each val epoch that does NOT set
+    # a new best. Restored from checkpoint so resume preserves it.
+    epochs_since_best: int = 0
 
     resume_path = config.MODEL.RESUME
     if not resume_path and config.TRAIN.AUTO_RESUME:
@@ -215,6 +218,7 @@ def main():
         )
         global_step = meta['global_step']
         best_val = meta['best_val']
+        epochs_since_best = int(meta.get('epochs_since_best', 0))
         if meta['step_in_epoch'] > 0:
             # mid-epoch running checkpoint: resume in the same epoch, skip
             # the first N batches (sampler is deterministic via set_epoch).
@@ -292,7 +296,14 @@ def main():
             assert frames.shape[1] == MAX_FRAMES
             assert frames.shape[-1] == config.DATA.IMG_SIZE  # 1008 — RoPE constraint
 
-            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
+            # cache_enabled=False — critical for BF16 training. Without it,
+            # autocast's weight cache returns STALE bf16 casts of fp32 params
+            # even after optimizer.step() (cache is only invalidated by
+            # GradScaler.unscale_(), which we don't call in BF16 mode). The
+            # stale cache causes the optimizer to descend a different objective
+            # than the one produced by a fresh load of the same weights.
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp,
+                                    cache_enabled=False):
                 s_out = student(frames, attn_mask)              # [B,T,256,H',W']
                 with torch.no_grad():
                     t_out = teacher(frames, attn_mask, gt_masks, mask_valid)  # [B,T,256,H',W']
@@ -348,6 +359,7 @@ def main():
                     step_in_epoch=step + 1,
                     model=student.module, optimizer=optimizer, scheduler=scheduler,
                     scaler=scaler, best_val=best_val, ema=ema_perceiver,
+                    epochs_since_best=epochs_since_best,
                 )
                 log(f"[stage2] ep{epoch} it{step+1}: running ckpt -> {rpath}")
 
@@ -416,7 +428,11 @@ def main():
             if best_val is None or result.total < best_val:
                 best_val = result.total
                 is_best = True
+                epochs_since_best = 0
                 log(f"[stage2] new best val={best_val:.4f}")
+            else:
+                epochs_since_best += 1
+                log(f"[stage2] no new best (since_best={epochs_since_best}, current={result.total:.4f} vs best={best_val:.4f})")
 
             # second val pass with EMA weights swapped in (if enabled)
             if ema_perceiver is not None:
@@ -447,10 +463,19 @@ def main():
                 model=student.module, optimizer=optimizer, scheduler=scheduler,
                 scaler=scaler, best_val=best_val, is_best=is_best,
                 ema=ema_perceiver,
+                epochs_since_best=epochs_since_best,
             )
             log(f"[stage2] saved {path}{'  [best]' if is_best else ''}")
         if dist.is_initialized():
             dist.barrier()
+
+        # -- early stopping check ----------------------------------------
+        patience = int(getattr(config.TRAIN, 'EARLY_STOP_PATIENCE', 0))
+        if patience > 0 and epochs_since_best >= patience:
+            log(f"[stage2] EARLY STOP at epoch {epoch}: "
+                f"{epochs_since_best} consecutive val epochs without a new "
+                f"best (patience={patience}); best_val={best_val:.4f}")
+            break
 
     if writer is not None:
         writer.close()

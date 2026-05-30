@@ -1,5 +1,36 @@
 # EfficientSAM3 — Handoff for a New LLM Agent
 
+## 2026-05-15 12:57 GMT+6 — Autocast cache bug found and fixed
+
+Two prior runs (`ep50_run2` and `ep50_run4`) silently corrupted themselves
+because `torch.amp.autocast(..., cache_enabled=True)` (the default) caches
+bf16 casts of fp32 parameters but only invalidates them through
+`GradScaler.unscale_()` — which we don't call in pure BF16 training. The
+cached bf16 weights went stale immediately after `optimizer.step()`, so every
+training-time forward used a "ghost" model that lagged the true fp32 state.
+
+Symptoms:
+- training-time `loss`, `val_total`, `mw` all looked healthy
+- saving the checkpoint and loading it in a *fresh* process produced
+  catastrophic loss (12.6 → 79 → 83) and `s_norm` 800× too large
+- the diagnostic chain that proved it lives in `tools/debug_*.py`
+
+Fix: 3 lines, `cache_enabled=False` on every `torch.amp.autocast(...)` call:
+- `stage2/train.py:295`
+- `stage2/eval/distill_eval.py:71, 107`
+- `stage2/smoke_test_models.py:71`
+
+Verified by `tools/debug_verify_fix.py`: with the fix, trained model_A and
+fresh + `load_state_dict(...)` model_B produce **bit-exact** forward output.
+
+Current run is **`ep50_run4`** (clean restart from ep0 with the fix in place).
+The collapsed run3 ckpts are kept in `archive/stage2_failed_run3_autocast_cache/`
+for forensics.
+
+---
+
+
+
 **Purpose:** if the user shifts this project to a different agent, this document is the single entry point to pick up without re-deriving state.
 
 **Read order:**
@@ -13,18 +44,18 @@
 
 ## 1. Current State Snapshot — 2026-05-14 13:00 +0600
 
-- **Stage 2 (Temporal Memory Distillation) training is RUNNING.** Run tag **`ep50_run3`** (fresh restart from epoch 0).
+- **Stage 2 (Temporal Memory Distillation) training is RUNNING.** Run tag **`ep50_run4`** (fresh restart from epoch 0).
 - Launched: 2026-05-14 12:53 local
-- Output dir: `output/efficient_sam3_stage2/ep50_run3/`
-- TensorBoard logs: `output/efficient_sam3_stage2/ep50_run3/tb/`
-- Train log: `logs/stage2_run3.log`
-- Train PID file: `logs/stage2_run3.pid`
+- Output dir: `output/efficient_sam3_stage2/ep50_run4/`
+- TensorBoard logs: `output/efficient_sam3_stage2/ep50_run4/tb/`
+- Train log: `logs/stage2_run4.log`
+- Train PID file: `logs/stage2_run4.pid`
 - Target: 50 epochs (~11 days at 2.7 ips, ~5.3 h/epoch)
 - Dashboard: **http://localhost:6007** (also reachable on LAN at `http://<host-ip>:6007`)
 
 If the process has died, see §5 (Resume).
 
-### Why ep50_run3 (and not run2)
+### Why ep50_run4 (and not run2)
 
 **`ep50_run2` collapsed silently and was archived.** Investigation 2026-05-14 found that the saved checkpoints (`ckpt_epoch_0…3.pth`) contain Perceiver weights in a degenerate regime: `mlp_out.2.weight` std grew from healthy init 0.018 to **1.09** (~50× too large). Standalone `--eval` on those checkpoints reproduces `s_norm ≈ 12,000` per token vs teacher's ~15 (s/t ≈ 800×), i.e. complete output direction inversion.
 
@@ -86,9 +117,9 @@ Distillation target: teacher's `pix_feat_with_mem` per frame. Loss: `MSE + cosin
 | `/mnt/hdd/checkpoints/sam3/sam3.pt` | SAM3 ViT-H teacher (frozen) |
 | `/mnt/hdd/datasets/SA-V/` | 60 tar files, 1.1 TB |
 | `data/sav_index_v2.pkl` | Pre-built SA-V index cache |
-| `output/efficient_sam3_stage2/ep50_run3/` | **Active run output** |
-| `logs/stage2_run3.log` | Training stdout/stderr |
-| `logs/stage2_run3.pid` | PID of active torchrun |
+| `output/efficient_sam3_stage2/ep50_run4/` | **Active run output** |
+| `logs/stage2_run4.log` | Training stdout/stderr |
+| `logs/stage2_run4.pid` | PID of active torchrun |
 | `logs/dashboard.{log,pid}` | Dashboard process |
 | `logs/health.log` | Hourly health snapshot (cron → `scripts/health_check.sh`) |
 | `archive/stage2_failed_run2_collapsed/` | Old run2 (collapsed) kept for forensics |
@@ -107,28 +138,28 @@ Open `http://localhost:6007` (or LAN IP). The status pill auto-refreshes every 5
 
 ### Quick CLI check
 ```bash
-ps -fp $(cat /home/saif/github/efficientsam3/logs/stage2_run3.pid) 2>/dev/null | tail -1 || echo DIED
+ps -fp $(cat /home/saif/github/efficientsam3/logs/stage2_run4.pid) 2>/dev/null | tail -1 || echo DIED
 nvidia-smi --query-gpu=memory.used,utilization.gpu,temperature.gpu --format=csv,noheader
-tail -40 /home/saif/github/efficientsam3/logs/stage2_run3.log
+tail -40 /home/saif/github/efficientsam3/logs/stage2_run4.log
 ```
 
 ### Collapse early-warning grep
 ```bash
 # mw (mlp_out.2.weight std) should stay below ~0.1 throughout training
-grep -Eo "mw=[0-9.]+" /home/saif/github/efficientsam3/logs/stage2_run3.log | tail -20
+grep -Eo "mw=[0-9.]+" /home/saif/github/efficientsam3/logs/stage2_run4.log | tail -20
 # s_norm should hover near teacher's ~15 (allow 5-25 range)
-grep -Eo "s_norm=[0-9.]+" /home/saif/github/efficientsam3/logs/stage2_run3.log | tail -20
+grep -Eo "s_norm=[0-9.]+" /home/saif/github/efficientsam3/logs/stage2_run4.log | tail -20
 ```
 
 ### Validation loss (every 1 epoch now)
 ```bash
-grep -Ei "\[stage2\]\[val" /home/saif/github/efficientsam3/logs/stage2_run3.log
+grep -Ei "\[stage2\]\[val" /home/saif/github/efficientsam3/logs/stage2_run4.log
 ```
 
 ### TensorBoard
 ```bash
 source /home/saif/venvs/tf/bin/activate
-tensorboard --logdir output/efficient_sam3_stage2/ep50_run3/tb --port 6008 --bind_all
+tensorboard --logdir output/efficient_sam3_stage2/ep50_run4/tb --port 6008 --bind_all
 # port 6008 because the dashboard already owns 6007
 ```
 
@@ -151,10 +182,10 @@ pgrep -af "stage2/train.py" && echo "ALREADY RUNNING" && exit 1
 nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
   --data-path /mnt/hdd/datasets/SA-V/ \
-  --tag ep50_run3 \
+  --tag ep50_run4 \
   --output output \
-  > logs/stage2_run3.log 2>&1 &
-echo $! > logs/stage2_run3.pid
+  > logs/stage2_run4.log 2>&1 &
+echo $! > logs/stage2_run4.pid
 ```
 
 All anti-collapse settings (NORM_WEIGHT, CLIP_GRAD, WEIGHT_DECAY, EVAL frequency, worker count) live in the YAML now, so no `--opts` overrides needed.

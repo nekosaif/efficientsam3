@@ -145,7 +145,7 @@
   <div class="h-6 w-px bg-slate-700 mx-1"></div>
 
   <label class="text-xs text-slate-500 mono">tag:</label>
-  <input id="ctrl-tag" class="ctrl-input" value="ep50_run3" spellcheck="false"/>
+  <input id="ctrl-tag" class="ctrl-input" value="" placeholder="(auto)" spellcheck="false"/>
 
   <label class="text-xs text-slate-500 mono">port:</label>
   <input id="ctrl-port" class="ctrl-input" value="29510" type="number" min="1024" max="65535" style="width:80px"/>
@@ -626,8 +626,13 @@ setInterval(fetchCharts, CHART_INTERVAL_MS);
 const TRAIN_STATUS_INTERVAL_MS = 5000;
 
 function _currentTag() {
+  // Prefer the explicit tag the user typed; otherwise use the most recent
+  // run-tag the snapshot reports; otherwise the placeholder default.
   const el = document.getElementById('ctrl-tag');
-  return (el && el.value.trim()) || 'ep50_run3';
+  if (el && el.value.trim()) return el.value.trim();
+  const rt = document.getElementById('run-tag');
+  if (rt && rt.textContent && rt.textContent.trim() !== '—') return rt.textContent.trim();
+  return 'ep50_run4';
 }
 
 async function refreshTrainStatus() {

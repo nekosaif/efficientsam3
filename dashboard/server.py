@@ -24,11 +24,27 @@ REPO_ROOT = Path(__file__).parent.parent.resolve()
 LOGS_DIR = REPO_ROOT / "logs"
 
 # Default launch profile — matches the production runbook.
-DEFAULT_TAG = "ep50_run3"
+# Tag defaults to the newest existing run-dir under output/efficient_sam3_stage2/
+# so "Start" on the dashboard resumes the right run instead of clobbering it
+# with a different tag.
 DEFAULT_CFG = "stage2/configs/sav_repvit_m0_9.yaml"
 DEFAULT_DATA = "/mnt/hdd/datasets/SA-V/"
 DEFAULT_OUTPUT = "output"
 DEFAULT_PORT = 29510
+
+
+def _resolve_default_tag() -> str:
+    base = Path(DEFAULT_OUTPUT)
+    runs_root = REPO_ROOT / base / "efficient_sam3_stage2"
+    if runs_root.is_dir():
+        candidates = [d for d in runs_root.iterdir() if d.is_dir()]
+        if candidates:
+            candidates.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+            return candidates[0].name
+    return "ep50_run4"
+
+
+DEFAULT_TAG = _resolve_default_tag()
 
 app = FastAPI(title="EfficientSAM3 Dashboard", docs_url=None, redoc_url=None)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
