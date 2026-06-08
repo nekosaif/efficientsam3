@@ -3,9 +3,9 @@
 Launch:
     torchrun --nproc_per_node=2 stage2/train.py \\
         --cfg stage2/configs/sav_repvit_m0_9.yaml \\
-        --data-path /mnt/hdd/datasets/SA-V/ \\
+        --data-path /mnt/exoshdd/datasets/SA-V/ \\
         --student-ckpt checkpoints/efficient_sam3_repvit_s.pt \\
-        --teacher-ckpt /mnt/hdd/checkpoints/sam3/sam3.pt \\
+        --teacher-ckpt /mnt/exoshdd/checkpoints/sam3/sam3.pt \\
         --output output --tag stage2_run0
 
 Production loop: full memory-bank teacher (Step 7 done), checkpoint
@@ -33,7 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from stage2.config import get_config, MAX_FRAMES
 from stage2.data.build import build_loader
 from stage2.eval import evaluate_distill
-from stage2.loss import build_distill_loss
+from stage2.loss import build_distill_loss, build_mask_loss
 from stage2.models import ModelEma, build_student_model, build_teacher_model
 from stage2.optim import CosineWarmupScheduler, build_optimizer
 from stage2.utils import (
@@ -160,14 +160,37 @@ def main():
     log(f"[stage2] student trainable={n_train/1e6:.2f}M total={n_total/1e6:.2f}M  "
         f"teacher total={sum(p.numel() for p in teacher.parameters())/1e6:.2f}M (frozen)")
 
+    # Prompt conditioning leaves some PromptEncoder params (point/box embeddings)
+    # unused when the batch prompt is mask-only, so DDP needs unused-param detection.
+    find_unused = config.TRAIN.FIND_UNUSED_PARAMETERS or bool(
+        getattr(config.MODEL, 'PROMPT_CONDITIONING', False))
     student = DDP(
         student,
         device_ids=[local_rank],
-        find_unused_parameters=config.TRAIN.FIND_UNUSED_PARAMETERS,
+        find_unused_parameters=find_unused,
     )
 
     # -- loss / optim / sched -----------------------------------------------
     loss_fn = build_distill_loss(config).to(device)
+
+    # mask-prompted (Milestone 1) flags + mask loss
+    prompt_conditioning = bool(getattr(config.MODEL, 'PROMPT_CONDITIONING', False))
+    mask_loss_weight = float(getattr(config.DISTILL, 'MASK_LOSS_WEIGHT', 0.0))
+    teacher_frame0_only = bool(getattr(config.DISTILL, 'TEACHER_FRAME0_ONLY', False))
+    mask_loss_fn = build_mask_loss(config).to(device) if (prompt_conditioning and mask_loss_weight > 0) else None
+    if prompt_conditioning:
+        log(f"[stage2] PROMPT_CONDITIONING on: mask_loss_w={mask_loss_weight} "
+            f"teacher_frame0_only={teacher_frame0_only}")
+
+    # Lazy teacher-target cache: frozen teacher is deterministic per (video_id,
+    # obj_idx), so cache its output once and replay it (skips ~81% of iter compute).
+    teacher_cache = None
+    tc_dir = str(getattr(config.DISTILL, 'TEACHER_CACHE_DIR', '') or '')
+    if tc_dir:
+        from stage2.teacher_cache import TeacherTargetCache
+        teacher_cache = TeacherTargetCache(tc_dir, enabled=True)
+        log(f"[stage2] teacher-target cache ON -> {tc_dir}")
+
     optimizer = build_optimizer(config, student.module)
 
     iters_per_epoch = max(1, len(loader_train))
@@ -239,7 +262,7 @@ def main():
         from torch.utils.tensorboard import SummaryWriter
         tb_dir = os.path.join(config.OUTPUT, config.MODEL.NAME, config.TAG, 'tb')
         os.makedirs(tb_dir, exist_ok=True)
-        writer = SummaryWriter(log_dir=tb_dir)
+        writer = SummaryWriter(log_dir=tb_dir, flush_secs=10)
         log(f"[stage2] tensorboard logs -> {tb_dir}")
 
     # -- eval-only mode -----------------------------------------------------
@@ -261,6 +284,8 @@ def main():
             use_amp=use_amp, max_batches=args.val_max_batches,
             calibrate_bn_batches=args.calibrate_bn_batches,
             backbone_bn_train_mode=args.backbone_bn_train_mode,
+            prompt_conditioning=prompt_conditioning,
+            teacher_frame0_only=teacher_frame0_only,
         )
         log(f"[stage2][eval:{eval_split_label}] total={result.total:.4f} mse={result.mse:.4f} "
             f"cos={result.cosine:.4f} norm={result.norm:.4f} n={result.n_batches}")
@@ -296,6 +321,12 @@ def main():
             assert frames.shape[1] == MAX_FRAMES
             assert frames.shape[-1] == config.DATA.IMG_SIZE  # 1008 — RoPE constraint
 
+            # mask-prompted (Milestone 1): frame-0 prompt steers the memory toward
+            # the selected object; teacher conditions on GT mask only at frame 0.
+            prompt = None
+            if prompt_conditioning and 'prompt_mask' in batch:
+                prompt = {'mask': batch['prompt_mask'].to(device, non_blocking=True)}
+
             # cache_enabled=False — critical for BF16 training. Without it,
             # autocast's weight cache returns STALE bf16 casts of fp32 params
             # even after optimizer.step() (cache is only invalidated by
@@ -304,14 +335,45 @@ def main():
             # than the one produced by a fresh load of the same weights.
             with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp,
                                     cache_enabled=False):
-                s_out = student(frames, attn_mask)              # [B,T,256,H',W']
-                with torch.no_grad():
-                    t_out = teacher(frames, attn_mask, gt_masks, mask_valid)  # [B,T,256,H',W']
-                losses = loss_fn(s_out, t_out, attn_mask)
-                loss = losses.total / accum
+                if prompt_conditioning:
+                    s_out, hires = student(frames, attn_mask, prompt=prompt,
+                                           return_high_res=(mask_loss_weight > 0))
+                else:
+                    s_out = student(frames, attn_mask)          # [B,T,256,H',W']
+
+                # Teacher target: replay from cache when available (frozen teacher
+                # is deterministic per (video_id, obj_idx)); else run it live and
+                # back-fill the cache. The teacher is ~81% of per-iter compute, so
+                # a warm cache makes iters ~5x faster (tools/profile_iter.py).
+                t_out = None
+                cache_hit = False
+                if teacher_cache is not None:
+                    per_shape = (s_out.shape[1], s_out.shape[2], s_out.shape[3], s_out.shape[4])
+                    t_out, cache_hit, _miss = teacher_cache.get_batch(
+                        batch['video_ids'], batch['obj_idx'], per_shape, device)
+                if not cache_hit:
+                    with torch.no_grad():
+                        t_out = teacher(frames, attn_mask, gt_masks, mask_valid,
+                                        frame0_only=teacher_frame0_only)  # [B,T,256,H',W']
+                    if teacher_cache is not None:
+                        teacher_cache.put_batch(batch['video_ids'], batch['obj_idx'], t_out)
+                losses = loss_fn(s_out, t_out.to(s_out.dtype), attn_mask)
+                loss = losses.total
+                # mask supervision on the decoded masks vs GT
+                mask_bce_val = mask_dice_val = None
+                if prompt_conditioning and mask_loss_weight > 0:
+                    student_mod = student.module if hasattr(student, 'module') else student
+                    s_logits = student_mod.decode_masks(s_out, hires)
+                    ml = mask_loss_fn(s_logits, gt_masks, mask_valid)
+                    loss = loss + mask_loss_weight * ml.total
+                    mask_bce_val = ml.bce.item()
+                    mask_dice_val = ml.dice.item()
+                loss = loss / accum
 
             loss_val = loss.item()
-            if not (loss_val == loss_val) or loss_val > 10.0:  # NaN or explosion
+            # mask BCE can legitimately be large early on; raise the guard when on.
+            bad_thresh = 100.0 if (prompt_conditioning and mask_loss_weight > 0) else 10.0
+            if not (loss_val == loss_val) or loss_val > bad_thresh:  # NaN or explosion
                 log(f"[stage2] BAD BATCH ep{epoch} it{step}: loss={loss_val:.2f} — skipping update")
                 optimizer.zero_grad(set_to_none=True)
                 n_window += frames.shape[0]
@@ -373,12 +435,14 @@ def main():
                     )
                 gn_str = f"gn={grad_norm_val:.3f}" if grad_norm_val is not None else "gn=--"
                 mw_str = f"mw={mlp_out_w_std_val:.3f}" if mlp_out_w_std_val is not None else "mw=--"
+                mask_str = (f" mbce={mask_bce_val:.3f} mdice={mask_dice_val:.3f}"
+                            if mask_bce_val is not None else "")
                 log(f"[stage2] ep{epoch} it{step}/{len(loader_train)} "
                     f"loss={losses.total.item():.4f} mse={losses.mse.item():.4f} "
                     f"cos={losses.cosine.item():.4f} norm={losses.norm.item():.4f} "
                     f"lr={scheduler.get_lr():.2e} "
                     f"ips={ips:.2f} mask_sum={attn_mask.sum().item()} "
-                    f"{gn_str} {mw_str} s_norm={s_token_norm_val:.2f}")
+                    f"{gn_str} {mw_str} s_norm={s_token_norm_val:.2f}{mask_str}")
                 # note: ips = samples/sec (n_window += batch_size); iter/s = ips / batch_size
                 if writer is not None:
                     writer.add_scalar('train/loss_total', losses.total.item(), global_step)
@@ -417,6 +481,8 @@ def main():
                 student=student.module, teacher=teacher, loader=loader_val,
                 loss_fn=loss_fn, device=device, amp_dtype=amp_dtype,
                 use_amp=use_amp, max_batches=args.val_max_batches,
+                prompt_conditioning=prompt_conditioning,
+                teacher_frame0_only=teacher_frame0_only,
             )
             log(f"[stage2][val] ep{epoch} total={result.total:.4f} mse={result.mse:.4f} "
                 f"cos={result.cosine:.4f} norm={result.norm:.4f} n={result.n_batches}")

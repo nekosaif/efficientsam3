@@ -39,6 +39,8 @@ def evaluate_distill(
     max_batches: int = -1,
     calibrate_bn_batches: int = 0,
     backbone_bn_train_mode: bool = False,
+    prompt_conditioning: bool = False,
+    teacher_frame0_only: bool = False,
 ) -> DistillEvalResult:
     """
     calibrate_bn_batches: if > 0, run this many loader batches in train() mode
@@ -105,13 +107,24 @@ def evaluate_distill(
         gt_masks = batch['masks'].to(device, non_blocking=True)
         mask_valid = batch['mask_valid'].to(device, non_blocking=True)
 
+        # Mirror the TRAINING forward exactly, else val measures a different task
+        # than train optimizes (flat val despite learning). Prompt-condition the
+        # student and use the same frame0_only teacher target as training.
+        prompt = None
+        if prompt_conditioning and 'prompt_mask' in batch:
+            prompt = {'mask': batch['prompt_mask'].to(device, non_blocking=True)}
+
         # cache_enabled=False — match the production training context. Stale
         # bf16 weight cache otherwise gives different forward output than the
         # training-time forward. See debug_definitive.py for the proof.
         with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp,
                                 cache_enabled=False):
-            s_out = student(frames, attn)
-            t_out = teacher(frames, attn, gt_masks, mask_valid)
+            if prompt_conditioning:
+                s_out = student(frames, attn, prompt=prompt)
+            else:
+                s_out = student(frames, attn)
+            t_out = teacher(frames, attn, gt_masks, mask_valid,
+                            frame0_only=teacher_frame0_only)
             losses = loss_fn(s_out, t_out, attn)
 
         if debug_per_batch:

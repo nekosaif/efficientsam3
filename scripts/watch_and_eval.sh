@@ -25,7 +25,7 @@ CKPT="${1:-output/efficient_sam3_stage2/ep50_run2/ckpt_epoch_1.pth}"
 LOG="${2:-logs/autoeval_ep1.log}"
 TAG="${3:-ep50_run2}"
 CFG="stage2/configs/sav_repvit_m0_9.yaml"
-DATA="/mnt/hdd/datasets/SA-V/"
+DATA="/mnt/exoshdd/datasets/SA-V/"
 MAX_BATCHES=100     # ~5-10 min, limits GPU memory overlap with training
 MASTER_PORT=29512   # different from training's 29511
 

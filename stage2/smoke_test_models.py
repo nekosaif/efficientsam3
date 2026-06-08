@@ -5,7 +5,7 @@ Run:
 
 Validates:
   - Student loads RepViT M0.9 from checkpoints/efficient_sam3_repvit_s.pt
-  - Teacher loads SAM3 ViT-H from /mnt/hdd/checkpoints/sam3/sam3.pt
+  - Teacher loads SAM3 ViT-H from /mnt/exoshdd/checkpoints/sam3/sam3.pt
   - Perceiver is wired in on the student
   - Forward over [1, 8, 3, 1024, 1024] produces matching shapes on both
 """
@@ -32,7 +32,7 @@ def main():
         batch_size = 1
         data_path = None
         student_ckpt = 'checkpoints/efficient_sam3_repvit_s.pt'
-        teacher_ckpt = '/mnt/hdd/checkpoints/sam3/sam3.pt'
+        teacher_ckpt = '/mnt/exoshdd/checkpoints/sam3/sam3.pt'
         resume = None
         output = 'output'
         tag = 'smoke'

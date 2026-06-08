@@ -99,7 +99,7 @@ Override keeps frozen backbone BatchNorm layers in eval mode during training:
 ```bash
 torchrun --nproc_per_node=1 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
-  --data-path /mnt/hdd/datasets/SA-V/ \
+  --data-path /mnt/exoshdd/datasets/SA-V/ \
   --tag ep50_run1 \
   --resume output/efficient_sam3_stage2/ep50_run1/ckpt_epoch_17.pth \
   --eval \

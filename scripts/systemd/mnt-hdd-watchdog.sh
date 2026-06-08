@@ -37,27 +37,9 @@ _alive() {
 }
 
 _launch_training() {
-  if _alive "$TRAIN_PIDFILE"; then
-    return 0
-  fi
-  if ! mountpoint -q "$MOUNT"; then
-    log "skip training launch — $MOUNT not mounted"
-    return 1
-  fi
-  log "relaunching training (tag=$TAG)"
-  runuser -u "$USR" -- bash -c "cd '$REPO' && rm -f '$TRAIN_PIDFILE' && \
-    nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
-      --cfg stage2/configs/sav_repvit_m0_9.yaml \
-      --data-path /mnt/hdd/datasets/SA-V/ \
-      --tag $TAG --output output \
-      >> '$TRAIN_LOG' 2>&1 & echo \$! > '$TRAIN_PIDFILE'" \
-    >>"$LOG" 2>&1
-  sleep 2
-  if _alive "$TRAIN_PIDFILE"; then
-    log "  training pid=$(cat "$TRAIN_PIDFILE")"
-  else
-    log "  training launch failed"
-  fi
+  # Training auto-resume disabled by user request 2026-05-30.
+  # HDD auto-remount + dashboard relaunch remain active.
+  return 0
 }
 
 _launch_dashboard() {

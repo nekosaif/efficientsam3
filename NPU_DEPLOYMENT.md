@@ -183,7 +183,7 @@ Best balance of NPU performance and segmentation quality. Full INT8 activations 
 
 ### Calibration dataset
 
-Use ~200–500 frames from SA-V validation set (`/mnt/hdd/datasets/SA-V/`). Segmentation models are sensitive to calibration — use diverse scenes with:
+Use ~200–500 frames from SA-V validation set (`/mnt/exoshdd/datasets/SA-V/`). Segmentation models are sensitive to calibration — use diverse scenes with:
 - Fine object boundaries
 - Multiple objects per frame
 - Varying illumination

@@ -109,3 +109,67 @@ def build_distill_loss(config) -> DistillLoss:
         cosine_weight=config.DISTILL.COSINE_WEIGHT,
         norm_weight=config.DISTILL.NORM_WEIGHT,
     )
+
+
+@dataclass
+class MaskLossOutput:
+    total: torch.Tensor
+    bce: torch.Tensor
+    dice: torch.Tensor
+
+
+class MaskLoss(nn.Module):
+    """BCE + Dice on student-predicted mask logits vs GT masks.
+
+    Supervises the actual tracking output (mask-prompted, Milestone 1), not only
+    the intermediate features. GT masks are downsized to the logits' resolution.
+    Per-frame valid mask excludes padded / object-absent frames.
+    """
+
+    def __init__(self, bce_weight: float = 1.0, dice_weight: float = 1.0, eps: float = 1e-6):
+        super().__init__()
+        self.bce_weight = bce_weight
+        self.dice_weight = dice_weight
+        self.eps = eps
+
+    def forward(
+        self,
+        student_logits: torch.Tensor,   # [B, T, 1, h, w]
+        gt_masks: torch.Tensor,         # [B, T, H, W] in {0,1}
+        valid: Optional[torch.Tensor] = None,  # [B, T] bool — True = real frame w/ object
+    ) -> MaskLossOutput:
+        B, T, _, h, w = student_logits.shape
+        logits = student_logits.reshape(B * T, 1, h, w)
+        # downsize GT to logits resolution
+        gt = gt_masks.reshape(B * T, 1, *gt_masks.shape[-2:]).float()
+        if gt.shape[-2:] != (h, w):
+            gt = F.interpolate(gt, size=(h, w), mode='bilinear', align_corners=False)
+        gt = (gt > 0.5).float()
+
+        if valid is None:
+            valid = torch.ones(B, T, dtype=torch.bool, device=student_logits.device)
+        vmask = valid.reshape(B * T).float()                 # [B*T]
+        n_valid = vmask.sum().clamp_min(self.eps)
+
+        # BCE (per-frame mean, then valid-weighted average over frames)
+        bce_map = F.binary_cross_entropy_with_logits(logits, gt, reduction='none')
+        bce_per = bce_map.flatten(1).mean(dim=1)             # [B*T]
+        bce = (bce_per * vmask).sum() / n_valid
+
+        # Dice on probabilities
+        prob = torch.sigmoid(logits).flatten(1)             # [B*T, h*w]
+        g = gt.flatten(1)
+        inter = (prob * g).sum(dim=1)
+        denom = prob.sum(dim=1) + g.sum(dim=1)
+        dice_per = 1.0 - (2 * inter + self.eps) / (denom + self.eps)
+        dice = (dice_per * vmask).sum() / n_valid
+
+        total = self.bce_weight * bce + self.dice_weight * dice
+        return MaskLossOutput(total=total, bce=bce.detach(), dice=dice.detach())
+
+
+def build_mask_loss(config) -> MaskLoss:
+    return MaskLoss(
+        bce_weight=float(getattr(config.DISTILL, 'MASK_BCE_WEIGHT', 1.0)),
+        dice_weight=float(getattr(config.DISTILL, 'MASK_DICE_WEIGHT', 1.0)),
+    )

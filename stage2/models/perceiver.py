@@ -17,7 +17,7 @@ Returned:
 from __future__ import annotations
 
 import math
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -63,6 +63,35 @@ class _CrossAttnBlock(nn.Module):
         return latents
 
 
+class _PromptConditionBlock(nn.Module):
+    """Seed the latents from a frame-0 prompt: cross-attn(latents <- prompt) + MLP.
+
+    Makes the carried memory OBJECT-SELECTIVE — the same frames yield different
+    latents (and thus different memory features / masks) for different prompts.
+    """
+
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: float, dropout: float):
+        super().__init__()
+        self.norm_q = nn.LayerNorm(dim)
+        self.norm_kv = nn.LayerNorm(dim)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim, num_heads=num_heads, dropout=dropout, batch_first=True,
+        )
+        hidden = int(dim * mlp_ratio)
+        self.norm_mlp = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, dim),
+        )
+
+    def forward(self, latents: torch.Tensor, prompt_tokens: torch.Tensor) -> torch.Tensor:
+        q = self.norm_q(latents)
+        kv = self.norm_kv(prompt_tokens)
+        x, _ = self.cross_attn(q, kv, kv, need_weights=False)
+        latents = latents + x
+        latents = latents + self.mlp(self.norm_mlp(latents))
+        return latents
+
+
 class TemporalPerceiver(nn.Module):
     def __init__(
         self,
@@ -72,14 +101,23 @@ class TemporalPerceiver(nn.Module):
         num_heads: int = 8,
         mlp_ratio: float = 4.0,
         dropout: float = 0.0,
+        prompt_conditioning: bool = False,
     ):
         super().__init__()
         self.dim = dim
         self.num_latents = num_latents
+        self.prompt_conditioning = prompt_conditioning
 
         # initial latents carried at t=0
         self.init_latents = nn.Parameter(torch.zeros(1, num_latents, dim))
         nn.init.trunc_normal_(self.init_latents, std=0.02)
+
+        # optional prompt-conditioning: seed latents from a frame-0 prompt embedding
+        # so the memory is steered toward the selected object (mask/point/box).
+        self.prompt_block = (
+            _PromptConditionBlock(dim, num_heads, mlp_ratio, dropout)
+            if prompt_conditioning else None
+        )
 
         # per-step temporal embedding added to latents (supports up to 8 frames)
         self.temporal_embed = nn.Parameter(torch.zeros(8, 1, dim))
@@ -102,10 +140,20 @@ class TemporalPerceiver(nn.Module):
             nn.Linear(int(dim * mlp_ratio), dim),
         )
 
-    def init_memory(self, batch_size: int, device=None, dtype=None) -> torch.Tensor:
+    def init_memory(self, batch_size: int, device=None, dtype=None,
+                    prompt_tokens: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Initial latents at t=0.
+
+        If prompt_conditioning is on and prompt_tokens [B, P, C] are given, the
+        latents are seeded toward the prompted object via cross-attention; this
+        is what makes the model object-selective. Otherwise returns the learned
+        constant latents (object-agnostic, original behavior).
+        """
         x = self.init_latents.expand(batch_size, -1, -1).contiguous()
         if device is not None or dtype is not None:
             x = x.to(device=device, dtype=dtype)
+        if self.prompt_block is not None and prompt_tokens is not None:
+            x = self.prompt_block(x, prompt_tokens.to(dtype=x.dtype, device=x.device))
         return x
 
     def forward(

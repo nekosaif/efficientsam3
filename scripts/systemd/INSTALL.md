@@ -1,4 +1,11 @@
-# Auto-mount /mnt/hdd + auto-resume Stage 2 training on boot
+# Auto-mount /mnt/hdd (+ dashboard) on boot
+
+> **2026-05-30 — Stage-2 training auto-resume DISABLED by user request.**
+> The `_launch_training()` function in `mnt-hdd-watchdog.sh` is now a no-op, so the
+> watchdog no longer relaunches `torchrun … stage2/train.py`. The **HDD auto-remount**
+> and **dashboard relaunch** still work. To re-enable training auto-resume, restore the
+> original `_launch_training()` body (see git history), re-copy the script to
+> `/usr/local/bin/`, and `sudo systemctl restart mnt-hdd-watchdog`.
 
 Two pieces of recovery automation:
 
@@ -8,9 +15,9 @@ Two pieces of recovery automation:
    - re-mounts `/mnt/hdd` within ~20 s if it disappears (USB/SATA reset,
      sleep/wake, etc.)
    - after every successful mount (and at boot), checks that the **dashboard**
-     and the **Stage 2 training process** are alive — relaunches them via
-     `runuser -u saif` if not. This is what makes "training resumes on
-     reboot" work.
+     is alive — relaunches it via `runuser -u saif` if not.
+   - ~~Stage 2 training auto-relaunch~~ — **disabled 2026-05-30** (see banner above);
+     `_launch_training()` is a no-op, training is no longer resurrected.
 
 The watchdog uses `ckpt_running.pth` for resume, so you lose at most the work
 since the last mid-epoch save (~12 min @ `SAVE_EVERY_ITERS=2000`).
@@ -85,14 +92,9 @@ sudo rm /etc/systemd/system/mnt-hdd-watchdog.service /usr/local/bin/mnt-hdd-watc
 
 ## Notes / gotchas
 
-- The watchdog will keep relaunching training on every crash. If you want it
-  off temporarily (e.g. to do code edits), `sudo systemctl stop
-  mnt-hdd-watchdog` first; remember to `sudo systemctl start
-  mnt-hdd-watchdog` when you're done.
-- It only relaunches if `logs/stage2_run4.pid` is dead. If training is
-  legitimately stopped because you killed it manually and want it to **stay**
-  stopped, also stop the watchdog (otherwise it'll resurrect training in
-  ~20 s).
+- Training auto-resume is **disabled** (2026-05-30) — the watchdog no longer
+  relaunches `stage2/train.py`, so killing training now keeps it down. The
+  HDD-remount and dashboard-relaunch loops are unaffected.
 - Tag is hard-coded to `ep50_run4`. Change `TAG=…` at the top of
   `mnt-hdd-watchdog.sh` for future runs and re-copy.
 - The watchdog runs as root but uses `runuser -u saif` to drop privileges

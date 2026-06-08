@@ -28,7 +28,7 @@ LOGS_DIR = REPO_ROOT / "logs"
 # so "Start" on the dashboard resumes the right run instead of clobbering it
 # with a different tag.
 DEFAULT_CFG = "stage2/configs/sav_repvit_m0_9.yaml"
-DEFAULT_DATA = "/mnt/hdd/datasets/SA-V/"
+DEFAULT_DATA = "/mnt/exoshdd/datasets/SA-V/"
 DEFAULT_OUTPUT = "output"
 DEFAULT_PORT = 29510
 

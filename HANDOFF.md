@@ -91,7 +91,7 @@ Archived to `archive/stage2_failed_run2_collapsed/{ckpts,logs,tb}/` for forensic
 
 EfficientSAM3 distills Meta's SAM3 ViT-H video segmentation model into a mobile-deployable form for the Samsung Galaxy S26 Ultra's Qualcomm Hexagon NPU. ONNX export with static shapes requires `MAX_FRAMES=8`, `IMG_SIZE=1008`. Stage 1 (done) distilled the image encoder → RepViT-M0.9. Stage 2 (running) distills the sequential memory bank → a 4-layer TemporalPerceiver with 64 learnable latents. Stage 3 (next) = ONNX export + on-device test.
 
-Dataset: **SA-V** (SAM2 video, 50,583 clips, 1.1 TB at `/mnt/hdd/datasets/SA-V/`). 49,594 train / 989 val via deterministic SHA1-hash split, `val_fraction=0.02`.
+Dataset: **SA-V** (SAM2 video, 50,583 clips, 1.1 TB at `/mnt/exoshdd/datasets/SA-V/`). 49,594 train / 989 val via deterministic SHA1-hash split, `val_fraction=0.02`.
 
 Distillation target: teacher's `pix_feat_with_mem` per frame. Loss: `MSE + cosine + 2.0 × norm_log_ratio`, all on L2-normalized features. Teacher + Stage-1 backbone both frozen; only the Perceiver (5.02 M params) has gradients.
 
@@ -115,7 +115,7 @@ Distillation target: teacher's `pix_feat_with_mem` per frame. Loss: `MSE + cosin
 | `stage2/utils/checkpoint.py` | Save/load incl. EMA shadow and backbone BN buffers |
 | `checkpoints/efficient_sam3_repvit_s.pt` | Stage 1 student (frozen) |
 | `/mnt/hdd/checkpoints/sam3/sam3.pt` | SAM3 ViT-H teacher (frozen) |
-| `/mnt/hdd/datasets/SA-V/` | 60 tar files, 1.1 TB |
+| `/mnt/exoshdd/datasets/SA-V/` | 60 tar files, 1.1 TB |
 | `data/sav_index_v2.pkl` | Pre-built SA-V index cache |
 | `output/efficient_sam3_stage2/ep50_run4/` | **Active run output** |
 | `logs/stage2_run4.log` | Training stdout/stderr |
@@ -181,7 +181,7 @@ pgrep -af "stage2/train.py" && echo "ALREADY RUNNING" && exit 1
 
 nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
-  --data-path /mnt/hdd/datasets/SA-V/ \
+  --data-path /mnt/exoshdd/datasets/SA-V/ \
   --tag ep50_run4 \
   --output output \
   > logs/stage2_run4.log 2>&1 &

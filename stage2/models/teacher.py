@@ -103,7 +103,19 @@ class TeacherModel(nn.Module):
         self,
         frames: torch.Tensor,        # [B,T,3,H,W]
         masks: torch.Tensor,         # [B,T,H,W] binary float
+        frame0_only: bool = False,   # condition on GT mask only at frame 0
     ) -> torch.Tensor:
+        """Build per-frame `pix_feat_with_mem` distillation targets.
+
+        frame0_only=False (legacy): condition on the GT mask EVERY frame — the
+        target "cheats" by re-seeing ground truth, which a frames-only student
+        can never reproduce.
+
+        frame0_only=True (mask-prompted): condition on the GT mask ONLY at frame
+        0, then propagate the tracker's own PREDICTED masks for t>0 — exactly
+        what a prompted tracker produces at inference. This is the target a
+        prompt-conditioned student should match.
+        """
         B, T = frames.shape[:2]
         per_frame = self._backbone_per_frame(frames)
 
@@ -136,13 +148,26 @@ class TeacherModel(nn.Module):
             )
             targets.append(pix_feat_with_mem)
 
-            # (b) derive obj_ptr / object_score_logits from GT mask
-            gt_mask_t = masks[:, t:t + 1]  # [B,1,H,W]
-            sam_outs = self.tracker._use_mask_as_output(
-                backbone_features=pix_feat_with_mem,
-                high_res_features=high_res_features,
-                mask_inputs=gt_mask_t,
-            )
+            # (b) obtain the mask used to encode this frame's memory.
+            use_gt_mask = (not frame0_only) or is_init
+            if use_gt_mask:
+                # condition on GROUND-TRUTH mask (every frame, or just frame 0)
+                gt_mask_t = masks[:, t:t + 1]  # [B,1,H,W]
+                sam_outs = self.tracker._use_mask_as_output(
+                    backbone_features=pix_feat_with_mem,
+                    high_res_features=high_res_features,
+                    mask_inputs=gt_mask_t,
+                )
+            else:
+                # t>0 in frame0_only mode: PREDICT the mask from memory (no GT),
+                # mirroring real prompted propagation.
+                sam_outs = self.tracker._forward_sam_heads(
+                    backbone_features=pix_feat_with_mem,
+                    point_inputs=None,
+                    mask_inputs=None,
+                    high_res_features=high_res_features,
+                    multimask_output=False,
+                )
             _, high_res_masks, _, _, _, obj_ptr, object_score_logits = sam_outs
 
             # (c) encode new memory for future frames
@@ -181,12 +206,16 @@ class TeacherModel(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         masks: Optional[torch.Tensor] = None,
         mask_valid: Optional[torch.Tensor] = None,
+        frame0_only: bool = False,
     ) -> torch.Tensor:
         """
         frames:         [B,T,3,H,W]
         attention_mask: [B,T] (currently unused; SA-V loader picks valid frames)
         masks:          [B,T,H,W] binary GT masklet (required for memory path)
         mask_valid:     [B,T] bool (currently must be all True)
+        frame0_only:    if True, condition on GT mask only at frame 0 then
+                        propagate predicted masks (mask-prompted target). If False,
+                        condition on GT every frame (legacy object-agnostic target).
         Returns:        [B,T,256,H',W']
         """
         B, T = frames.shape[:2]
@@ -202,7 +231,7 @@ class TeacherModel(nn.Module):
         # frame — _use_mask_as_output / _encode_new_memory handle the "no-obj"
         # branch via is_obj_appearing on the GT mask itself, so we can pass through.
         del mask_valid
-        return self._forward_with_memory(frames, masks)
+        return self._forward_with_memory(frames, masks, frame0_only=frame0_only)
 
 
 def build_teacher_model(config) -> TeacherModel:

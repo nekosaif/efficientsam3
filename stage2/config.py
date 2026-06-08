@@ -18,9 +18,13 @@ _C.DATA = CN()
 _C.DATA.BATCH_SIZE = 2  # per-GPU, video memory-heavy
 _C.DATA.DATA_PATH = ''
 _C.DATA.DATASET = 'sav'
-_C.DATA.SAV_TAR_DIR = '/mnt/hdd/datasets/SA-V/'
+_C.DATA.SAV_TAR_DIR = '/mnt/exoshdd/datasets/SA-V/'
 _C.DATA.SAV_TAR_RANGE = [0, 55]  # reserved for numbered splits; 60 hash-named tars globbed directly
 _C.DATA.SAV_INDEX_CACHE = 'data/sav_index.pkl'
+# Optional pre-decoded bundle dir (NVMe). When set + a bundle exists for a video,
+# the loader reads JPEG frames from it instead of opening the tar/mp4 (skips the
+# HDD random-seek + video decode). Empty = off. See tools/predecode_sav.py.
+_C.DATA.PREDECODE_DIR = ''
 _C.DATA.MEAN = [123.675, 116.28, 103.53]
 _C.DATA.STD = [58.395, 57.12, 57.375]
 _C.DATA.IMG_SIZE = 1008  # SAM3 ViT-H RoPE freqs_cis baked at 1008; both models trained at this size
@@ -52,6 +56,12 @@ _C.MODEL.PERCEIVER_HEADS = 8
 _C.MODEL.PERCEIVER_MLP_RATIO = 4.0
 _C.MODEL.PERCEIVER_DROPOUT = 0.0
 
+# Mask-prompted tracking (Milestone 1): condition the memory on a frame-0 prompt
+# (mask/point/box) so the model tracks the SELECTED object. When False, the model
+# is object-agnostic (original Stage-2 behavior).
+_C.MODEL.PROMPT_CONDITIONING = False
+_C.MODEL.FEAT_SIZE = 72  # student memory-feature grid (1008 input -> 72x72)
+
 # -----------------------------------------------------------------------------
 # Distillation settings
 # -----------------------------------------------------------------------------
@@ -61,6 +71,18 @@ _C.DISTILL.MSE_WEIGHT = 1.0
 _C.DISTILL.COSINE_WEIGHT = 1.0
 _C.DISTILL.NORM_WEIGHT = 0.0          # log-ratio norm matching (0 = off); set >0 to prevent mlp collapse
 _C.DISTILL.FEATURE_DIM = 256         # teacher pix_feat_with_mem channel dim
+
+# Mask-prompted training (Milestone 1): supervise decoded masks vs GT.
+_C.DISTILL.MASK_LOSS_WEIGHT = 0.0    # overall weight of the mask (BCE+Dice) term; 0 = off
+_C.DISTILL.MASK_BCE_WEIGHT = 1.0
+_C.DISTILL.MASK_DICE_WEIGHT = 1.0
+# Build the teacher target with GT mask only at frame 0 (mask-prompted) vs every
+# frame (legacy). Should track MODEL.PROMPT_CONDITIONING.
+_C.DISTILL.TEACHER_FRAME0_ONLY = False
+# Lazy teacher-target cache dir (NVMe recommended). Empty = off. When set, the
+# frozen teacher's output is cached per (video_id, obj_idx) and replayed on later
+# epochs, skipping ~81% of per-iter compute. ~490 GB int8 for the full train set.
+_C.DISTILL.TEACHER_CACHE_DIR = ''
 
 # -----------------------------------------------------------------------------
 # Training settings

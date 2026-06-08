@@ -19,7 +19,7 @@ def main():
     args = ap.parse_args()
 
     ds = SAVVideoDataset(
-        '/mnt/hdd/datasets/SA-V/',
+        '/mnt/exoshdd/datasets/SA-V/',
         index_cache='data/sav_index.pkl',
         img_size=args.img_size,
     )

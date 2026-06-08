@@ -12,7 +12,7 @@ from typing import Any
 import yaml
 
 PROJECT_ROOT = Path(__file__).parent.parent
-CONFIG_PATH = PROJECT_ROOT / "stage2" / "configs" / "sav_repvit_m0_9.yaml"
+# CONFIG_PATH is assigned below, after RUN_TAG resolves (see _resolve_config_path).
 
 
 def _resolve_run_tag() -> str:
@@ -36,8 +36,31 @@ _short = RUN_TAG.replace("ep50_", "") if RUN_TAG.startswith("ep50_") else RUN_TA
 LOG_PATH = PROJECT_ROOT / "logs" / f"stage2_{_short}.log"
 TB_DIR = PROJECT_ROOT / "output" / "efficient_sam3_stage2" / RUN_TAG / "tb"
 
-# Cache for TB accumulator
+
+def _resolve_config_path():
+    """Use the run's own saved config if present, else fall back to the configs/
+    dir. Prefer a `_prompt` variant when the tag indicates a prompt-conditioned
+    run, so the dashboard reads the SAME epochs/batch the live run uses (not the
+    stale default yaml)."""
+    cfgs = PROJECT_ROOT / "stage2" / "configs"
+    if "prompt" in RUN_TAG or "m1" in RUN_TAG:
+        p = cfgs / "sav_repvit_m0_9_prompt.yaml"
+        if p.exists():
+            return p
+    return cfgs / "sav_repvit_m0_9.yaml"
+
+
+CONFIG_PATH = _resolve_config_path()
+
+# Cache for TB accumulator (merged result, keyed on live-file mtime)
 _tb_cache: dict[str, Any] = {"mtime": 0.0, "data": {}}
+
+# Cache for the immutable historical (dead-run) tfevents files. These never
+# change once a run ends, so parse them ONCE keyed by their filename set and
+# reuse forever. Only the live (newest) file is re-parsed per request. Without
+# this, every poll re-parsed all N restart files (~34 MB across 20 runs),
+# which—at the 2s snapshot poll rate—pegged the CPU and made loads take minutes.
+_tb_hist_cache: dict[str, Any] = {"key": None, "per_tag": {}}
 
 # Cache for log parse (refresh every 2s)
 _log_cache: dict[str, Any] = {"ts": 0.0, "data": {}}
@@ -70,37 +93,61 @@ def _active_tb_file() -> Path | None:
     return files[-1] if files else None
 
 
-def _load_tb_scalars() -> dict[str, list]:
-    """Return dict tag -> list of (step, value). Cached by the newest file's mtime.
+def _parse_tb_file(path: Path) -> dict[str, dict[int, float]]:
+    """Parse one tfevents file -> {tag: {step: value}}."""
+    from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    ea = EventAccumulator(str(path), size_guidance={"scalars": 0})
+    ea.Reload()
+    out: dict[str, dict[int, float]] = {}
+    for tag in ea.Tags().get("scalars", []):
+        bucket = out.setdefault(tag, {})
+        for e in ea.Scalars(tag):
+            bucket[e.step] = e.value
+    return out
 
-    Reads EVERY event file in TB_DIR and merges series across them (training
-    restarts each produce a new tfevents file). Within each tag the points are
-    sorted by step and de-duplicated keeping the last value for each step.
+
+def _load_tb_scalars() -> dict[str, list]:
+    """Return dict tag -> list of (step, value), merged across all restart files.
+
+    Hot path optimization: the historical (all-but-newest) files are immutable
+    once their run ends, so they are parsed ONCE and cached by their filename
+    set. Only the live (newest) file is re-parsed each call, and only when its
+    mtime changes. This keeps the 2s snapshot poll cheap even with many restart
+    files present. Later files overwrite earlier ones at the same step.
     """
     files = _all_tb_files()
     if not files:
         return {}
-    mtime = max(f.stat().st_mtime for f in files)
-    n_files = len(files)
-    cached_n = _tb_cache.get("n_files", 0)
-    if mtime == _tb_cache["mtime"] and n_files == cached_n and _tb_cache["data"]:
-        return _tb_cache["data"]
+
+    live = files[-1]
+    hist = files[:-1]
 
     try:
-        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
-        per_tag: dict[str, dict[int, float]] = {}
-        for f in files:
-            ea = EventAccumulator(str(f), size_guidance={"scalars": 0})
-            ea.Reload()
-            for tag in ea.Tags().get("scalars", []):
-                bucket = per_tag.setdefault(tag, {})
-                for e in ea.Scalars(tag):
-                    bucket[e.step] = e.value  # later files overwrite same step
+        # --- historical files: parse once, cache by filename set ---
+        hist_key = tuple(str(f) for f in hist)
+        if _tb_hist_cache["key"] != hist_key:
+            merged_hist: dict[str, dict[int, float]] = {}
+            for f in hist:
+                for tag, bucket in _parse_tb_file(f).items():
+                    merged_hist.setdefault(tag, {}).update(bucket)
+            _tb_hist_cache["key"] = hist_key
+            _tb_hist_cache["per_tag"] = merged_hist
+
+        # --- live file: re-read only when its mtime changes ---
+        live_mtime = live.stat().st_mtime
+        if live_mtime == _tb_cache["mtime"] and _tb_cache["data"]:
+            return _tb_cache["data"]
+
+        per_tag: dict[str, dict[int, float]] = {
+            tag: dict(bucket) for tag, bucket in _tb_hist_cache["per_tag"].items()
+        }
+        for tag, bucket in _parse_tb_file(live).items():
+            per_tag.setdefault(tag, {}).update(bucket)
+
         data: dict[str, list] = {
             tag: sorted(bucket.items()) for tag, bucket in per_tag.items()
         }
-        _tb_cache["mtime"] = mtime
-        _tb_cache["n_files"] = n_files
+        _tb_cache["mtime"] = live_mtime
         _tb_cache["data"] = data
         return data
     except Exception:

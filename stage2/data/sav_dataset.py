@@ -80,6 +80,8 @@ class SAVVideoDataset(Dataset):
         split: str = 'train',
         val_fraction: float = 0.02,
         prefer_manual: bool = True,
+        select_first_object: bool = False,
+        predecode_dir: Optional[str] = None,
     ):
         assert max_frames == MAX_FRAMES, \
             f"max_frames must equal MAX_FRAMES ({MAX_FRAMES}) for ONNX static shape"
@@ -91,6 +93,14 @@ class SAVVideoDataset(Dataset):
         self.std = np.array(pixel_std, dtype=np.float32).reshape(1, 1, 3)
         self.split = split
         self.prefer_manual = prefer_manual
+        # If True, always pick the first valid object (legacy object-agnostic
+        # behavior). If False (default for mask-prompted training), pick an
+        # arbitrary valid object deterministically per sample index.
+        self.select_first_object = select_first_object
+        # Optional pre-decoded bundle dir (NVMe). When a bundle exists for a video
+        # we load its JPEG frames + masklet instead of opening the tar/mp4 — skips
+        # the HDD random-seek + video decode. Falls back to the live path on miss.
+        self.predecode_dir = predecode_dir
 
         # bump cache name with version so v1 caches don't collide with v2 schema
         if index_cache:
@@ -127,8 +137,22 @@ class SAVVideoDataset(Dataset):
         if cache_path and os.path.exists(cache_path):
             with open(cache_path, 'rb') as f:
                 idx = pickle.load(f)
-            print(f"[SAVVideoDataset] loaded index cache {cache_path}: {len(idx)} videos")
-            return idx
+            # The cache stores ABSOLUTE tar paths from whatever host dir it was
+            # built on. Rewrite each tar_path onto the CURRENT tar_dir (keeping
+            # the basename) so the index is portable across dataset relocations
+            # (e.g. /mnt/hdd -> /mnt/exoshdd) without a costly rebuild.
+            rewritten = 0
+            new_idx: List[Tuple[str, str, str]] = []
+            for tar_path, mp4_member, json_member in idx:
+                want = os.path.join(self.tar_dir, os.path.basename(tar_path))
+                if want != tar_path:
+                    rewritten += 1
+                new_idx.append((want, mp4_member, json_member))
+            if rewritten:
+                print(f"[SAVVideoDataset] repointed {rewritten}/{len(new_idx)} "
+                      f"index entries to tar_dir={self.tar_dir}")
+            print(f"[SAVVideoDataset] loaded index cache {cache_path}: {len(new_idx)} videos")
+            return new_idx
 
         tar_paths = sorted(glob.glob(os.path.join(self.tar_dir, '*.tar')))
         if not tar_paths:
@@ -307,6 +331,11 @@ class SAVVideoDataset(Dataset):
             'attention_mask': torch.zeros(self.max_frames, dtype=torch.bool),
             'masks': torch.zeros(self.max_frames, H, H, dtype=torch.float32),
             'mask_valid': torch.zeros(self.max_frames, dtype=torch.bool),
+            'prompt_mask': torch.zeros(1, H, H, dtype=torch.float32),
+            'prompt_box': torch.zeros(4, dtype=torch.float32),
+            'prompt_point': torch.zeros(2, dtype=torch.float32),
+            'prompt_valid': torch.zeros((), dtype=torch.bool),
+            'obj_idx': torch.tensor(-1, dtype=torch.long),
             'video_id': video_id,
         }
 
@@ -315,8 +344,44 @@ class SAVVideoDataset(Dataset):
     def __len__(self) -> int:
         return len(self.index)
 
+    def _load_predecoded(self, idx, mp4_member):
+        """Fast path: load a pre-decoded bundle (JPEG frames + masklet) if present.
+
+        Returns a sample dict, or None on miss/corruption (caller falls back to the
+        live tar/video path). Produces a byte-identical sample to the live path
+        because object selection + resize/pad run in the SHARED _assemble_sample.
+        """
+        import hashlib, json as _json
+        h = hashlib.sha1(mp4_member.encode()).hexdigest()
+        path = os.path.join(self.predecode_dir, h[:2], h + '.npz')
+        if not os.path.exists(path):
+            return None
+        try:
+            with np.load(path, allow_pickle=True) as z:
+                num_obj = int(z['num_obj'])
+                if num_obj == 0:
+                    return self._empty_sample(mp4_member)
+                frames_jpeg = list(z['frames_jpeg'])
+                picked_masklet = _json.loads(str(z['masklet_json']))
+            frames = []
+            for jb in frames_jpeg:
+                arr = np.frombuffer(bytes(jb), dtype=np.uint8)
+                bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+                if bgr is None:
+                    return None
+                frames.append(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB))
+            return self._assemble_sample(idx, mp4_member, frames, picked_masklet, num_obj)
+        except Exception:
+            return None  # corrupt bundle → fall back to live path
+
     def __getitem__(self, idx: int) -> Dict:
         tar_path, mp4_member, json_member = self.index[idx]
+
+        # ---- fast path: pre-decoded bundle (skips HDD seek + video decode) -----
+        if self.predecode_dir:
+            s = self._load_predecoded(idx, mp4_member)
+            if s is not None:
+                return s  # else fall through to the live decode path below
 
         handle = None
         try:
@@ -359,34 +424,89 @@ class SAVVideoDataset(Dataset):
         finally:
             self._decode_close(handle)
 
-        # Pick the first object (deterministic for now; multi-object later if needed).
-        obj_idx = 0
+        # picked_masklet[slot] = list of RLEs (one per object) at that picked frame
+        picked_masklet = [masklet[int(li)] for li in local_picks]
+        return self._assemble_sample(
+            idx, mp4_member, list(picked_frames), picked_masklet, num_obj)
 
+    # ---- shared post-decode assembly (live path & pre-decoded path) --------
+    def _assemble_sample(self, idx, video_id, picked_frames, picked_masklet, num_obj):
+        """Build the final sample from decoded frames + picked-frame masklets.
+
+        picked_frames: list of k uint8 [H0,W0,3] RGB arrays (one per picked frame).
+        picked_masklet: list of k lists, each [rle_obj0, rle_obj1, ...] for that frame.
+        Identical logic for the live (video-decode) and pre-decoded (JPEG) paths so
+        both produce byte-identical samples; object selection stays per-idx here.
+        """
         H = self.img_size
+
+        # ---- object selection (uses the PROMPT frame = slot 0) ----------------
+        # Pick an arbitrary VALID object at the prompt frame. Deterministic per
+        # sample index → stable across epochs; covers different objects across the
+        # dataset (not just obj 0). Done at load time, so the pre-decoded bundle
+        # (which keeps ALL objects) reproduces this exactly.
+        candidates = []
+        for oi in range(num_obj):
+            try:
+                m0 = _decode_rle(picked_masklet[0][oi])
+            except Exception:
+                continue
+            if m0.any():
+                candidates.append(oi)
+        if not candidates:
+            return self._empty_sample(video_id)
+        if self.select_first_object:
+            obj_idx = candidates[0]
+        else:
+            obj_idx = candidates[(idx * 2654435761) % len(candidates)]
+
         frames_out = torch.zeros(self.max_frames, 3, H, H, dtype=torch.float32)
         masks_out = torch.zeros(self.max_frames, H, H, dtype=torch.float32)
         attn_out = torch.zeros(self.max_frames, dtype=torch.bool)
         valid_out = torch.zeros(self.max_frames, dtype=torch.bool)
 
-        for slot, (rgb, li) in enumerate(zip(picked_frames, local_picks)):
+        for slot, rgb in enumerate(picked_frames):
             img_chw, scale, nh, nw = self._resize_pad_image(rgb)
             frames_out[slot] = torch.from_numpy(img_chw)
             attn_out[slot] = True
 
             try:
-                m_raw = _decode_rle(masklet[int(li)][obj_idx])        # [H0, W0] uint8
+                m_raw = _decode_rle(picked_masklet[slot][obj_idx])    # [H0, W0] uint8
             except Exception:
                 continue
             m_proc = self._resize_pad_mask(m_raw, scale, nh, nw)
             masks_out[slot] = torch.from_numpy(m_proc)
             valid_out[slot] = bool(m_raw.any())
 
+        # ---- frame-0 prompt ---------------------------------------------------
+        # Mask prompt = the selected object's GT mask on the prompt frame, at the
+        # padded model resolution. Box + centroid point are derived from it so the
+        # model can be trained/queried with mask, box, or point (user requirement).
+        prompt_mask = masks_out[0:1].clone()          # [1, H, H] float {0,1}
+        ys, xs = torch.where(prompt_mask[0] > 0.5)
+        if len(xs) > 0:
+            x0, x1 = int(xs.min()), int(xs.max())
+            y0, y1 = int(ys.min()), int(ys.max())
+            prompt_box = torch.tensor([x0, y0, x1, y1], dtype=torch.float32)
+            prompt_point = torch.tensor([float(xs.float().mean()), float(ys.float().mean())],
+                                        dtype=torch.float32)
+            prompt_valid = torch.ones((), dtype=torch.bool)
+        else:
+            prompt_box = torch.zeros(4, dtype=torch.float32)
+            prompt_point = torch.zeros(2, dtype=torch.float32)
+            prompt_valid = torch.zeros((), dtype=torch.bool)
+
         return {
             'frames': frames_out,
             'attention_mask': attn_out,
             'masks': masks_out,
             'mask_valid': valid_out,
-            'video_id': mp4_member,
+            'prompt_mask': prompt_mask,      # [1, H, H]
+            'prompt_box': prompt_box,        # [4] xyxy px (padded image)
+            'prompt_point': prompt_point,    # [2] xy px (padded image)
+            'prompt_valid': prompt_valid,    # () bool
+            'obj_idx': torch.tensor(obj_idx, dtype=torch.long),
+            'video_id': video_id,
         }
 
 
@@ -406,10 +526,18 @@ def sav_collate_fn(batch: List[Dict]) -> Dict:
     masks = torch.stack([b['masks'] for b in batch], dim=0)           # [B, 8, H, W]
     valid = torch.stack([b['mask_valid'] for b in batch], dim=0)      # [B, 8]
     video_ids = [b['video_id'] for b in batch]
-    return {
+    out = {
         'frames': frames,
         'attention_mask': attn,
         'masks': masks,
         'mask_valid': valid,
         'video_ids': video_ids,
     }
+    # prompt fields (present since Milestone-1; guard for older empty samples)
+    if 'prompt_mask' in batch[0]:
+        out['prompt_mask'] = torch.stack([b['prompt_mask'] for b in batch], dim=0)   # [B,1,H,W]
+        out['prompt_box'] = torch.stack([b['prompt_box'] for b in batch], dim=0)     # [B,4]
+        out['prompt_point'] = torch.stack([b['prompt_point'] for b in batch], dim=0) # [B,2]
+        out['prompt_valid'] = torch.stack([b['prompt_valid'] for b in batch], dim=0) # [B]
+        out['obj_idx'] = torch.stack([b['obj_idx'] for b in batch], dim=0)           # [B]
+    return out

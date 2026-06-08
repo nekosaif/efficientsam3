@@ -18,7 +18,7 @@ Also read `HANDOFF.md` (context) + `REPORT.md` (research) for background.
 | Train log | `logs/stage2_run1.log` |
 | TB log | `logs/tensorboard.log` |
 | Config | `stage2/configs/sav_repvit_m0_9.yaml` |
-| Dataset | `/mnt/hdd/datasets/SA-V/` |
+| Dataset | `/mnt/exoshdd/datasets/SA-V/` |
 | Epochs | 50 (`TRAIN.EPOCHS 50`) |
 | EMA | **ON**, decay 0.999 |
 | Mid-epoch ckpt | **disabled** (SAVE_EVERY_ITERS=0) |
@@ -119,7 +119,7 @@ pgrep -af "stage2/train.py" && echo "ALREADY RUNNING — do not relaunch" && exi
 
 nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
-  --data-path /mnt/hdd/datasets/SA-V/ \
+  --data-path /mnt/exoshdd/datasets/SA-V/ \
   --tag ep50_run1 \
   --opts TRAIN.EPOCHS 50 \
          TRAIN.EMA_ENABLE True \
@@ -180,7 +180,7 @@ rm -f logs/tensorboard.log logs/tensorboard.pid
 # 3. relaunch training (same as §3)
 nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
-  --data-path /mnt/hdd/datasets/SA-V/ \
+  --data-path /mnt/exoshdd/datasets/SA-V/ \
   --tag ep50_run1 \
   --opts TRAIN.EPOCHS 50 \
          TRAIN.EMA_ENABLE True \

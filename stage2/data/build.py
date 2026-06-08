@@ -22,6 +22,10 @@ def build_dataset(config, split: str = 'train'):
             index_cache=config.DATA.SAV_INDEX_CACHE,
             num_samples=(100 if config.DATA.DEBUG else config.DATA.NUM_SAMPLES),
             split=split,
+            # Mask-prompted training selects arbitrary objects; legacy object-
+            # agnostic runs (no prompt conditioning) keep picking object 0.
+            select_first_object=not bool(getattr(config.MODEL, 'PROMPT_CONDITIONING', False)),
+            predecode_dir=(str(getattr(config.DATA, 'PREDECODE_DIR', '')) or None),
         )
         return ds
     raise NotImplementedError(f"Unknown DATASET: {config.DATA.DATASET}")

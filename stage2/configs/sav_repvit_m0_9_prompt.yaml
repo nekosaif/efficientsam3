@@ -1,12 +1,17 @@
 # Stage 2 — Temporal Memory Distillation: RepViT-M0.9 student vs SAM3 ViT-H teacher
+# Milestone 1: mask-prompted (prompt-conditioned) tracking variant.
 # IMG_SIZE=1008 (SAM3 RoPE constraint), MAX_FRAMES=8 (ONNX static shape)
 
 DATA:
   DATASET: sav
   SAV_TAR_DIR: /mnt/exoshdd/datasets/SA-V/
   SAV_INDEX_CACHE: data/sav_index.pkl
+  PREDECODE_DIR: /home/saif/sav_predecoded   # NVMe JPEG bundles: skip HDD seek + video decode (~2x faster dataloader)
   BATCH_SIZE: 2
-  NUM_WORKERS: 16          # was 28; 16 phys cores on Ryzen 9 9950X. Reduces dataloader RSS by ~43%.
+  NUM_WORKERS: 24          # 16->24: more parallel decoders to absorb slow-clip bursts (GPU was
+                           # data-starved/fluctuating once the teacher cache made compute cheap).
+                           # prefetch kept at 2 — 24x2=48 in-flight units ~82GB RSS, safe on the
+                           # 123GB no-swap box (24x4 would OOM). 32 logical / 16 physical cores.
   PREFETCH_FACTOR: 2       # was 4. Halves in-flight batch queue (~14 GB → ~7 GB).
   PIN_MEMORY: true
   PERSISTENT_WORKERS: true
@@ -23,6 +28,8 @@ MODEL:
   PERCEIVER_DEPTH: 4
   PERCEIVER_LATENTS: 64
   PERCEIVER_HEADS: 8
+  # ---- Milestone 1: mask-prompted (prompt-conditioned) tracking ----
+  PROMPT_CONDITIONING: true
 
 DISTILL:
   ENABLED: true
@@ -30,6 +37,12 @@ DISTILL:
   COSINE_WEIGHT: 1.0
   NORM_WEIGHT: 2.0         # was 0.25 — ep50_run2 collapsed mlp_out to 50x init scale; 8x stronger.
   FEATURE_DIM: 256
+  # ---- Milestone 1 ----
+  MASK_LOSS_WEIGHT: 1.0      # supervise decoded masks vs GT (BCE+Dice)
+  MASK_BCE_WEIGHT: 1.0
+  MASK_DICE_WEIGHT: 1.0
+  TEACHER_FRAME0_ONLY: true  # teacher conditions on GT only at frame 0
+  TEACHER_CACHE_DIR: /home/saif/teacher_cache
 
 TRAIN:
   EPOCHS: 50
@@ -43,7 +56,9 @@ TRAIN:
   AMP_DTYPE: bfloat16
   ACCUMULATION_STEPS: 1
   SAVE_EVERY_ITERS: 2000   # mid-epoch atomic ckpt every ~12 min; caps SIGKILL loss.
-  EARLY_STOP_PATIENCE: 5   # stop after 5 consecutive val epochs without a new best.
+  EARLY_STOP_PATIENCE: 8   # 5->8: ep0-4 ran NORM_WEIGHT=0 (config bug), ep5+ =2.0, so the
+                           # baseline was reset at ep8 (best_val cleared); give the new-regime
+                           # run room before early-stopping. See ckpt_epoch_7 reset 2026-06-06.
 
 EVAL:
   EVERY_N_EPOCHS: 1        # was 5 — catch any collapse mode within the first epoch boundary.

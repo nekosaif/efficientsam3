@@ -183,7 +183,7 @@ manual relaunches in the meantime.
 EfficientSAM3 Stage 2 distills SAM3 ViT-H's sequential `pix_feat_with_mem`
 into a 5.02 M-parameter **TemporalPerceiver** while keeping the
 Stage 1 RepViT-M0.9 backbone frozen. Dataset: SA-V (50,583 videos, 1.1 TB
-at `/mnt/hdd/datasets/SA-V/`), 49,594 train / 989 val via SHA1-hash split.
+at `/mnt/exoshdd/datasets/SA-V/`), 49,594 train / 989 val via SHA1-hash split.
 Loss: `MSE + cosine + 2.0 × log(s/t)²` on L2-normalized features.
 Target deployment: Samsung Galaxy S26 Ultra Hexagon NPU at 1008 × 1008 × 8
 frames static-shape ONNX export.
@@ -246,7 +246,7 @@ nvidia-smi --query-gpu=memory.used,utilization.gpu --format=csv,noheader
 cd ~/github/efficientsam3
 nohup torchrun --nproc_per_node=1 --master_port 29510 stage2/train.py \
   --cfg stage2/configs/sav_repvit_m0_9.yaml \
-  --data-path /mnt/hdd/datasets/SA-V/ \
+  --data-path /mnt/exoshdd/datasets/SA-V/ \
   --tag ep50_run4 --output output \
   >> logs/stage2_run4.log 2>&1 &
 echo $! > logs/stage2_run4.pid
